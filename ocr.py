@@ -26,37 +26,11 @@ class Page:
     width: int
 
 
-def _disable_ir_optim() -> None:
-    """Stop paddle from rewriting the OCR graph into oneDNN fused kernels.
-
-    paddleocr 2.10 hardcodes `switch_ir_optim(True)` and ships PP-OCRv3/v4
-    models exported under paddle 2.x; running those through paddle 3.3's CPU
-    fusion passes produces a `fused_conv2d` the oneDNN context cannot fill
-    ("OneDnnContext does not have the input Filter"). The unfused graph runs
-    fine, so we turn the passes off at predictor construction -- the only hook
-    paddleocr leaves us, since its own `ir_optim` argument is ignored.
-    """
-    from paddle import inference
-
-    if getattr(inference.create_predictor, "_ir_optim_disabled", False):
-        return
-
-    original = inference.create_predictor
-
-    def create_predictor(config: Any) -> Any:
-        config.switch_ir_optim(False)
-        return original(config)
-
-    create_predictor._ir_optim_disabled = True
-    inference.create_predictor = create_predictor
-
-
 @lru_cache(maxsize=1)
 def _engine() -> Any:
     """Build the PaddleOCR engine once; model weights load lazily on first use."""
     from paddleocr import PaddleOCR
 
-    _disable_ir_optim()
     return PaddleOCR(lang="en", det_limit_side_len=DET_LIMIT_SIDE_LEN)
 
 
