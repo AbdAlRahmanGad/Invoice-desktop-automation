@@ -1,0 +1,70 @@
+# Python 3.10-3.13 only: paddlepaddle publishes no wheels for 3.14+.
+#
+#   uv venv --python 3.11 .venv && source .venv/bin/activate
+#   uv pip install -r requirements.txt
+#
+# --- Direct dependencies (7) -------------------------------------------
+# paddleocr    text detection + recognition. PINNED <3: paddleocr 3.x pulls
+#              paddlex/PP-OCRv6 and crashes here with NotImplementedError
+#              (ConvertPirAttribute2RuntimeAttribute) -- verified, do not bump
+#              without re-testing.
+# paddlepaddle inference runtime for paddleocr.
+# pypdfium2    renders PDF pages to images.
+# pillow       loads/upscales image inputs.
+# numpy        image arrays.
+# pydantic     the SalesOrder/LineItem schema.
+# setuptools   NOT a build tool here: paddlepaddle imports it at runtime
+#              (paddle.utils.cpp_extension) and fails on import without it.
+numpy==2.4.6
+paddleocr==2.10.0
+paddlepaddle==3.3.1
+pillow==12.3.0
+pydantic==2.13.5
+pypdfium2==5.13.0
+setuptools==84.0.0
+
+# --- Transitive, pinned for reproducibility (44) ---------------------
+albucore==0.0.24
+albumentations==2.0.8
+annotated-types==0.8.0
+anyio==4.14.2
+beautifulsoup4==4.15.0
+certifi==2026.7.22
+charset-normalizer==3.5.1
+cython==3.3.0
+fire==0.7.1
+fonttools==4.64.0
+h11==0.16.0
+httpcore==1.0.9
+httpx==0.28.1
+idna==3.19
+imageio==2.37.4
+lazy-loader==0.5
+lmdb==2.3.0
+lxml==6.1.2
+networkx==3.6.1
+opencv-contrib-python==5.0.0.93
+opencv-python-headless==5.0.0.93
+opencv-python==5.0.0.93
+opt-einsum==3.3.0
+packaging==26.3
+protobuf==7.36.1
+pyclipper==1.4.0
+pydantic-core==2.46.5
+python-docx==1.2.0
+pyyaml==6.0.3
+rapidfuzz==3.14.6
+requests==2.34.2
+safetensors==0.8.0
+scikit-image==0.26.0
+scipy==1.17.1
+shapely==2.1.2
+simsimd==6.5.16
+soupsieve==2.9.2
+stringzilla==5.1.2
+termcolor==3.3.0
+tifffile==2026.3.3
+tqdm==4.70.0
+typing-extensions==4.16.0
+typing-inspection==0.4.4
+urllib3==2.7.0
