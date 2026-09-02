@@ -1,8 +1,6 @@
 """Schema for an extracted sales order.
 
-Pure data: no OCR, no geometry, no I/O. Importing this module must stay cheap
-(pydantic only) so downstream consumers can depend on the shape of the result
-without pulling in PaddleOCR.
+Pure data: no OCR, no geometry, no I/O.
 """
 
 import re
@@ -18,6 +16,7 @@ def _to_number(value: Any) -> float | None:
     """Pull a number out of an OCR string ("EUR678.30" -> 678.30, "10%" -> 10.0)."""
     if not isinstance(value, str):
         return value
+    # "1,234.50" becomes "1234.50" but European "1.234,50" style not handled
     match = _NUMERIC_RE.search(value.replace(",", ""))
     return float(match.group()) if match else None
 

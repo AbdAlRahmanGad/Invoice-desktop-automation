@@ -1,9 +1,9 @@
-"""Extracting the TJM Labs "Sales Order Input" layout into a `SalesOrder`.
+"""Extracting the "Sales Order Input" layout into a `SalesOrder`.
 
 This is the document-specific layer: the label->field map below, and the rules
 for walking its label/value grid and items table. A differently laid-out
-document needs its own map (or a proper invoice2data YAML template); the
-geometry in `layout.py` and the OCR in `ocr.py` stay as they are.
+document needs its own map; the geometry in `layout.py` and the OCR
+in `ocr.py` stay as they are.
 """
 
 from typing import Any
