@@ -65,6 +65,33 @@ def render(path: str, scale: int) -> Any:
         pdf.close()
 
 
+def read_image(image: Any) -> list[TextBox]:
+    """OCR an already-rendered image.
+
+    Args:
+        image (Any): A PIL image or numpy array of the pixels to read.
+
+    Returns:
+        list[TextBox]: Recognised text, positioned in the image's own pixels.
+    """
+    import numpy as np
+
+    array = image if hasattr(image, "shape") else np.array(image.convert("RGB"))
+    result = _engine().ocr(array)
+    return [
+        TextBox(
+            text=text.strip(),
+            x=sum(p[0] for p in box) / 4,
+            y=sum(p[1] for p in box) / 4,
+            score=score,
+            left=min(p[0] for p in box),
+            right=max(p[0] for p in box),
+        )
+        for page in result or []
+        for box, (text, score) in page or []
+    ]
+
+
 def read_page(path: str, scale: int) -> Page:
     """OCR the first page of `path` at `scale`.
 
@@ -76,15 +103,4 @@ def read_page(path: str, scale: int) -> Page:
         Page: Recognised boxes plus the pixel width they are positioned in.
     """
     image = render(path, scale)
-    result = _engine().ocr(image)
-    boxes = [
-        TextBox(
-            text=text.strip(),
-            x=sum(p[0] for p in box) / 4,
-            y=sum(p[1] for p in box) / 4,
-            score=score,
-        )
-        for page in result or []
-        for box, (text, score) in page or []
-    ]
-    return Page(boxes=boxes, width=image.shape[1])
+    return Page(boxes=read_image(image), width=image.shape[1])

@@ -19,12 +19,19 @@ _NON_ALNUM_RE = re.compile(r"[^A-Z0-9]")
 
 @dataclass(frozen=True)
 class TextBox:
-    """One piece of recognised text, positioned by its centre point."""
+    """One piece of recognised text, positioned by its centre point.
+
+    `left` and `right` carry how wide the recognised region was, which matters
+    when reading a ruled table: a box whose extent crosses a column line has
+    swallowed two cells and has to be read again.
+    """
 
     text: str
     x: float
     y: float
     score: float = 1.0
+    left: float = 0.0
+    right: float = 0.0
 
 
 def normalize(text: str) -> str:
