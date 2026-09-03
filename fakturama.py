@@ -177,7 +177,7 @@ PAYMENT_CODES = {
 #: The order's totals, its own charges, and the number it is filed under
 #: (steps 4.2-4.4).
 ORDER_TOTAL_LABELS = {"net": "Total Net", "vat": "VAT", "gross": "Total"}
-ORDER_NUMBER_LABEL = "No."
+DOCUMENT_NUMBER_LABEL = "No."
 SHIPPING_LABEL = "Shipping"
 FREE_SHIPPING = "Free of shipping costs"
 
@@ -191,9 +191,10 @@ DOCUMENT_MATCH_COLUMNS = {
     "total": "Total",
 }
 
-#: What Documents shows in State for an order that has been saved but not yet
-#: turned into anything.
+#: What Documents shows in State: an order that has been saved and not yet
+#: turned into anything, and an invoice recorded as settled.
 OPEN_STATE = "open"
+PAID_STATE = "paid"
 
 #: Raising the next document from the order itself (steps 4.6-4.7). The
 #: follow-up controls are tall image buttons, which is what tells them from
@@ -202,12 +203,33 @@ FOLLOW_UP_INVOICE = "Invoice"
 FOLLOW_UP_MIN_HEIGHT = 40
 FOLLOW_UP_TAB_RE = r"^\*?New {kind}$"
 
+#: The invoice's payment row (steps 5.2-5.3): a checkbox, then an unnamed
+#: combo, a value and a date, none of which carry names of their own.
+PAID_LABEL = "paid"
+PAID_AT_LABEL = "at"
+PAID_VALUE_LABEL = "Value"
+
+#: The invoice raised from an order (step 5.1). Its own No., Invoice Date and
+#: Service date are proposed by Fakturama and left as they are; everything
+#: below is what the follow-up should have brought across from the order.
+NEW_INVOICE_TAB_RE = r"^\*?New Invoice$"
+ORDER_DATE_LABEL = "Order Date"
+INHERITED_LINE_COLUMNS = ("Item No", "Qty", "U.Price", "Discount", "Price")
+
 #: Columns of the item table used to find and check a line.
 ITEM_NUMBER_COLUMN = "Item No"
 NAME_COLUMN = "Name"
 
 #: Seconds to let a resized window settle before reading it.
 WINDOW_SETTLE_SECONDS = 1.0
+
+#: How far the item table's mouse canvas is inset inside the pane that draws
+#: it. The pair is what identifies the table in an editor.
+TABLE_INSET = 2
+
+#: How far below its tab an address box starts. Bounded, because the Remarks
+#: box further down the form is also unnamed and is the larger of the two.
+ADDRESS_BOX_REACH = 40
 
 #: The order's item table sits between these two labels, and its columns are
 #: named by their headers (steps 3.13-3.16). "Qty" and "Pos" lose the dot
@@ -426,6 +448,22 @@ def wait_for_order_editor(win: WindowSpecification, timeout: int = EDITOR_TIMEOU
     return wait_for_editor(win, NEW_ORDER_TAB_RE, "New Order", timeout)
 
 
+def _type_date(field: Any, wanted: date) -> None:
+    """Type a date into one of Fakturama's date widgets.
+
+    They take digits one date-field at a time and advance by themselves; a
+    written value is accepted and then thrown away (see `set_date`).
+
+    Args:
+        field (Any): The date widget.
+        wanted (date): The date it should hold.
+    """
+    digits = {"day": f"{wanted.day:02d}", "month": f"{wanted.month:02d}", "year": f"{wanted.year:04d}"}
+    tracing.point_at(field)
+    field.set_focus()
+    send_keys("{HOME}" + "".join(digits[name] for name in DATE_FIELD_ORDER))
+
+
 def _fields(editor: Any, label: str, control_type: str = "Edit") -> list[Any]:
     """Find the inputs belonging to `label`, left to right.
 
@@ -565,13 +603,9 @@ def set_date(editor: Any, order_date: str | date) -> None:
             for -- e.g. an install whose date fields run day-first.
     """
     wanted = date.fromisoformat(order_date) if isinstance(order_date, str) else order_date
-    digits = {"day": f"{wanted.day:02d}", "month": f"{wanted.month:02d}", "year": f"{wanted.year:04d}"}
 
     with tracing.step(f"set Date to {wanted.isoformat()}"):
-        field = _field(editor, "Date")
-        tracing.point_at(field)
-        field.set_focus()
-        send_keys("{HOME}" + "".join(digits[name] for name in DATE_FIELD_ORDER))
+        _type_date(_field(editor, "Date"), wanted)
 
     shown = _field(editor, "Date").get_value()
     try:
@@ -644,7 +678,7 @@ def set_price_mode(editor: Any, mode: str = NET_PRICE_MODE) -> None:
             tracing.point_at(combo)
             _select_option(combo, mode)
 
-    shown = _price_mode_combo(editor).selected_text()
+    shown = _combo_settles_on(lambda: _price_mode_combo(editor).selected_text(), mode)
     if shown != mode:
         raise ValueError(f"Price mode is {shown!r} after selecting {mode!r}.")
     tracing.point_at(_price_mode_combo(editor), colour=tracing.CONFIRM)
@@ -670,7 +704,7 @@ def set_vat_mode(editor: Any, mode: str = WITH_VAT) -> None:
             tracing.point_at(combo)
             _select_option(combo, mode)
 
-    shown = _field_combo(editor, "VAT").selected_text()
+    shown = _combo_settles_on(lambda: _field_combo(editor, "VAT").selected_text(), mode)
     if shown != mode:
         raise ValueError(f"VAT is {shown!r} after selecting {mode!r}.")
     tracing.point_at(_field_combo(editor, "VAT"), colour=tracing.CONFIRM)
@@ -1052,6 +1086,28 @@ def _close_popup(popup: WindowSpecification) -> None:
     win32gui.PostMessage(handle, win32con.WM_KEYUP, win32con.VK_ESCAPE, 0)
 
 
+def _combo_settles_on(read: Any, value: str) -> str:
+    """Wait for a combo to report the option that was just chosen.
+
+    The choice is applied a moment after it is made, so reading straight back
+    can still see the old value -- which looks exactly like a refused
+    selection. Read until it agrees or the time is up.
+
+    Args:
+        read (Any): A callable returning what the combo currently shows.
+        value (str): What it should come to show.
+
+    Returns:
+        str: What it shows at the end.
+    """
+    deadline = time.monotonic() + COMBO_TIMEOUT
+    shown = read()
+    while shown != value and time.monotonic() < deadline:
+        time.sleep(RESULTS_POLL_SECONDS)
+        shown = read()
+    return shown
+
+
 def _select_option(combo: Any, value: str) -> None:
     """Pick `value` in a combo, allowing for a list that is not ready yet.
 
@@ -1097,7 +1153,9 @@ def _set_combo(editor: Any, label: str, value: str) -> None:
         if not matching:
             raise LookupError(f"{label!r} has no {value!r} option; it offers {options}.")
         _select_option(combo, matching[0])
-    shown = _field(editor, label, control_type="ComboBox").selected_text().strip()
+    shown = _combo_settles_on(
+        lambda: _field(editor, label, control_type="ComboBox").selected_text().strip(), value
+    )
     if shown != value:
         raise ValueError(f"{label!r} is {shown!r} after selecting {value!r}.")
 
@@ -1144,7 +1202,8 @@ class PaymentMethodUnavailable(LookupError):
 
     def __init__(self, method: str, available: list[str]) -> None:
         super().__init__(
-            f"No payment method named {method!r}; this install has {available}."
+            f"No payment method named {method!r}; "
+            + (f"this install has {available}." if available else "and its list could not be read.")
         )
         self.method = method
         self.available = available
@@ -1163,7 +1222,18 @@ def combo_options(editor: Any, label: str) -> list[str]:
     Returns:
         list[str]: The option labels, in the order shown.
     """
-    combo = _field(editor, label, control_type="ComboBox")
+    return _combo_options(_field(editor, label, control_type="ComboBox"))
+
+
+def _combo_options(combo: Any) -> list[str]:
+    """List what a combo offers.
+
+    Args:
+        combo (Any): The combo box.
+
+    Returns:
+        list[str]: The option labels, in the order shown.
+    """
     combo.expand()
     try:
         deadline = time.monotonic() + COMBO_TIMEOUT
@@ -1470,12 +1540,21 @@ def order_addresses(editor: Any) -> dict[str, str]:
         name = tab.element_info.name or ""
         if ROLE_INVOICE.lower() in name.lower() or ROLE_DELIVERY.lower() in name.lower():
             select_tab(editor, name)
+            # Under the tab, not merely below it: an invoice has dated fields
+            # away to the right that would otherwise be read as the address.
+            anchor = tab.rectangle()
             boxes = [
                 c
                 for c in editor.descendants(control_type="Edit")
-                if not c.element_info.name and c.rectangle().top > tab.rectangle().bottom
+                if not c.element_info.name
+                and anchor.bottom <= c.rectangle().top <= anchor.bottom + ADDRESS_BOX_REACH
+                and c.rectangle().left <= anchor.right
             ]
-            addresses[name] = boxes[0].get_value() if boxes else ""
+            addresses[name] = (
+                max(boxes, key=lambda c: c.rectangle().width() * c.rectangle().height()).get_value()
+                if boxes
+                else ""
+            )
     return addresses
 
 
@@ -1835,50 +1914,35 @@ def money(text: str) -> float | None:
 
 
 def items_table(editor: Any) -> tuple[Any, Any]:
-    """The order's item table: the pane to read, and the canvas to click.
+    """The document's item table: the pane to read, and the canvas to click.
 
-    The table is two nested windows: an outer one whose pixels are the table
-    as drawn, and an inner canvas that handles the mouse. Clicks posted to the
-    outer one are ignored, which is why both are returned.
+    Found by its shape rather than by the label beside it -- the invoice
+    editor has no "Items" caption at all, though its table is built the same
+    way. That table is always a pane with a second pane inset a couple of
+    pixels inside it: the outer one draws the table, the inner one takes the
+    mouse. Clicks posted to the outer are ignored, which is why both come back.
 
     Args:
-        editor (Any): The order editor.
+        editor (Any): An order or invoice editor.
 
     Returns:
         tuple[Any, Any]: The pane to capture, and the canvas to click.
 
     Raises:
-        LookupError: If the item table is not where it should be.
+        LookupError: If no such pair is there.
     """
-    labels = {
-        c.element_info.name: c.rectangle()
-        for c in editor.descendants(control_type="Text")
-        if c.element_info.name in (ITEMS_LABEL, REMARKS_LABEL)
-    }
-    if ITEMS_LABEL not in labels:
-        raise LookupError(f"No {ITEMS_LABEL!r} label in the order editor.")
-    top = labels[ITEMS_LABEL].top
-    bottom = labels[REMARKS_LABEL].top if REMARKS_LABEL in labels else editor.rectangle().bottom
-
-    panes = [
-        c
-        for c in editor.descendants(control_type="Pane")
-        if getattr(c.element_info, "handle", None)
-        and c.rectangle().top >= top - LINE_TOLERANCE
-        and c.rectangle().bottom <= bottom
+    panes = [c for c in editor.descendants(control_type="Pane") if getattr(c.element_info, "handle", None)]
+    pairs = [
+        (outer, inner)
+        for outer in panes
+        for inner in panes
+        if inner is not outer
+        and inner.rectangle().left - outer.rectangle().left == TABLE_INSET
+        and inner.rectangle().top - outer.rectangle().top == TABLE_INSET
     ]
-    if not panes:
-        raise LookupError("No item table between the Items label and the Remarks box.")
-    outer = max(panes, key=lambda c: c.rectangle().width() * c.rectangle().height())
-    inside = [
-        c
-        for c in panes
-        if c is not outer
-        and outer.rectangle().left <= c.rectangle().left
-        and c.rectangle().right <= outer.rectangle().right
-        and c.rectangle().top >= outer.rectangle().top
-    ]
-    return outer, (max(inside, key=lambda c: c.rectangle().width() * c.rectangle().height()) if inside else outer)
+    if not pairs:
+        raise LookupError("No item table in this editor.")
+    return max(pairs, key=lambda pair: pair[1].rectangle().width() * pair[1].rectangle().height())
 
 
 def scroll_items(editor: Any, to_end: bool = False) -> None:
@@ -2178,19 +2242,127 @@ def confirm_order_charges(editor: Any) -> None:
         )
 
 
+def save_document(win: WindowSpecification, editor: Any, title_re: str, what: str) -> str:
+    """Save a document once, and return the number it was filed under.
+
+    The number is read first: saving renames the tab to it, so afterwards
+    there is no "New Order" or "New Invoice" left to look under.
+
+    Args:
+        win (WindowSpecification): The main window.
+        editor (Any): The document's editor.
+        title_re (str): Pattern matching its tab while unsaved.
+        what (str): The editor's name, for messages.
+
+    Returns:
+        str: The document's No.
+    """
+    number = _field(editor, DOCUMENT_NUMBER_LABEL).get_value()
+    save_editor(win, title_re, what)
+    return number
+
+
 def save_order(win: WindowSpecification, editor: Any) -> str:
-    """Save the order once, and return the number it was filed under (step 4.4).
+    """Save the order once (step 4.4).
 
     Args:
         win (WindowSpecification): The main window.
         editor (Any): The order editor.
 
     Returns:
-        str: The order's No., which is also what its tab is renamed to.
+        str: The order's No.
     """
-    number = _field(editor, ORDER_NUMBER_LABEL).get_value()
-    save_editor(win, NEW_ORDER_TAB_RE, "New Order")
-    return number
+    return save_document(win, editor, NEW_ORDER_TAB_RE, "New Order")
+
+
+def save_invoice(win: WindowSpecification, editor: Any) -> str:
+    """Save the invoice once (step 5.4).
+
+    Args:
+        win (WindowSpecification): The main window.
+        editor (Any): The invoice editor.
+
+    Returns:
+        str: The invoice's No.
+    """
+    return save_document(win, editor, NEW_INVOICE_TAB_RE, "New Invoice")
+
+
+def _view_button(view: Any, name: str) -> Any | None:
+    """One of a view's own window buttons, if it has it.
+
+    Args:
+        view (Any): A list view.
+        name (str): "Maximize" or "Restore".
+
+    Returns:
+        Any | None: The button, or None.
+    """
+    buttons = [c for c in view.descendants(control_type="Button") if c.element_info.name == name]
+    return buttons[0] if buttons else None
+
+
+def widen_view(win: WindowSpecification, name: str) -> Any:
+    """Give a list view the whole window, and return it.
+
+    A view sharing the window with an editor is narrow enough that its columns
+    are cut short -- "$678.30" arrives as "$6..." -- and a value that cannot
+    be read cannot be checked. Views offer Maximize for exactly this, and a
+    view already pushed aside offers Restore first.
+
+    Args:
+        win (WindowSpecification): The main window.
+        name (str): The view's name, e.g. "Documents".
+
+    Returns:
+        Any: The view, as wide as it goes.
+    """
+    view = open_list_view(win, name)
+    for label in ("Restore", "Maximize"):
+        button = _view_button(view, label)
+        if button:
+            button.iface_invoke.Invoke()
+            time.sleep(WINDOW_SETTLE_SECONDS)
+            view = open_list_view(win, name)
+    return view
+
+
+def unwiden_view(win: WindowSpecification, name: str) -> None:
+    """Give the window back to the editors.
+
+    Args:
+        win (WindowSpecification): The main window.
+        name (str): The view's name.
+    """
+    button = _view_button(open_list_view(win, name), "Restore")
+    if button:
+        button.iface_invoke.Invoke()
+        time.sleep(WINDOW_SETTLE_SECONDS)
+
+
+def confirm_documents(win: WindowSpecification, expected: dict[str, dict[str, str | None]]) -> dict[str, table.Row]:
+    """Check several documents in one look at the list (step 5.5).
+
+    The invoice and the order it came from are checked together, because what
+    the step is really asking is that raising and paying the invoice left the
+    order alone: same reference, same total, still open.
+
+    Args:
+        win (WindowSpecification): The main window.
+        expected (dict[str, dict[str, str | None]]): Document number -> the
+            columns it should show, keyed as in `DOCUMENT_MATCH_COLUMNS`.
+
+    Returns:
+        dict[str, table.Row]: The row found for each number.
+
+    Raises:
+        ManualReviewRequired: If any of them is missing or disagrees.
+    """
+    widen_view(win, DOCUMENTS_VIEW)
+    try:
+        return {number: confirm_document_row(win, number, **columns) for number, columns in expected.items()}
+    finally:
+        unwiden_view(win, DOCUMENTS_VIEW)
 
 
 def confirm_document_row(win: WindowSpecification, number: str, **expected: str | None) -> table.Row:
@@ -2278,6 +2450,299 @@ def create_follow_up(win: WindowSpecification, editor: Any, kind: str = FOLLOW_U
         follow_up = wait_for_editor(win, FOLLOW_UP_TAB_RE.format(kind=kind), f"New {kind}")
     tracing.point_at(follow_up, colour=tracing.CONFIRM)
     return follow_up
+
+
+def document_summary(editor: Any) -> dict[str, Any]:
+    """Everything about a document that a follow-up should inherit.
+
+    Read from the editor rather than from the database, because what the
+    steps ask to confirm is what a person would see on screen.
+
+    Args:
+        editor (Any): An order or invoice editor.
+
+    Returns:
+        dict[str, Any]: Reference, addresses, VAT mode, totals and lines.
+    """
+    lines, _, _ = read_items(editor, to_end=True)
+    return {
+        "reference": _field(editor, CUSTOMER_REFERENCE_LABEL).get_value(),
+        "addresses": order_addresses(editor),
+        "vat_mode": _field_combo(editor, "VAT").selected_text(),
+        "totals": order_totals(editor),
+        "lines": [
+            tuple(line.get(column) for column in INHERITED_LINE_COLUMNS)
+            for line in lines
+            if line.get(ITEM_NUMBER_COLUMN)
+        ],
+    }
+
+
+def confirm_invoice_from_order(win: WindowSpecification, number: str) -> dict[str, Any]:
+    """Confirm the invoice carries the order's content (step 5.1).
+
+    The follow-up is supposed to copy the order, so the order is what it is
+    checked against -- reading both editors and comparing, rather than
+    re-checking each field against the document a second time. The invoice's
+    own No., Invoice Date and Service date are Fakturama's to propose and are
+    left alone, so they are not compared.
+
+    Args:
+        win (WindowSpecification): The main window.
+        number (str): The saved order's number, which is its tab's name.
+
+    Returns:
+        dict[str, Any]: What the invoice holds.
+
+    Raises:
+        ManualReviewRequired: If anything the follow-up should have inherited
+            differs from the order.
+    """
+    order_editor = activate_editor(win, rf"^\*?{re.escape(number)}$", number)
+    from_order = document_summary(order_editor)
+    from_order["order_date"] = _field(order_editor, "Date").get_value()
+
+    invoice_editor = activate_editor(win, NEW_INVOICE_TAB_RE, "New Invoice")
+    from_invoice = document_summary(invoice_editor)
+    from_invoice["order_date"] = _field(invoice_editor, ORDER_DATE_LABEL).get_value()
+
+    complaints = [
+        f"{name} reads {from_invoice[name]!r}, the order has {value!r}"
+        for name, value in from_order.items()
+        if from_invoice[name] != value
+    ]
+    if complaints:
+        raise ManualReviewRequired(
+            f"The invoice does not carry {number}'s content: " + "; ".join(complaints), []
+        )
+    return from_invoice
+
+
+def _payment_combo(editor: Any) -> Any:
+    """The invoice's payment method combo.
+
+    It carries no accessible name, so it is found by what it stands next to:
+    the "paid" checkbox, on the same line of the form.
+
+    Args:
+        editor (Any): The invoice editor.
+
+    Returns:
+        Any: The combo box.
+
+    Raises:
+        LookupError: If the row is not there.
+    """
+    boxes = [c for c in editor.descendants(control_type="CheckBox") if c.element_info.name == PAID_LABEL]
+    if not boxes:
+        raise LookupError(f"No {PAID_LABEL!r} checkbox in the invoice editor.")
+    anchor = boxes[0].rectangle()
+    beside = [
+        c
+        for c in editor.descendants(control_type="ComboBox")
+        if c.rectangle().left >= anchor.right
+        and abs(c.rectangle().mid_point().y - anchor.mid_point().y) <= LINE_TOLERANCE
+    ]
+    if not beside:
+        raise LookupError(f"No payment method combo beside {PAID_LABEL!r}.")
+    return min(beside, key=lambda c: c.rectangle().left)
+
+
+def set_invoice_payment(editor: Any, method: str) -> str:
+    """Set or confirm the invoice's payment method (step 5.2).
+
+    The follow-up usually arrives with the debtor's method already on it, so
+    this is normally a confirmation. Where it is not, the method has to be one
+    Fakturama offers -- inventing one here would be a payment term nobody
+    agreed to, so a missing method stops the run instead.
+
+    Args:
+        editor (Any): The invoice editor.
+        method (str): The extracted payment method.
+
+    Returns:
+        str: The method the invoice ends up on.
+
+    Raises:
+        PaymentMethodUnavailable: If the invoice cannot offer that method.
+        ValueError: If the combo does not end up on it.
+    """
+    combo = _payment_combo(editor)
+    if combo.selected_text() == method:
+        return method
+
+    # Some of these combos do not put their items in the accessibility tree
+    # at all, so an empty list is "could not read", not "has none". Where the
+    # list is readable it decides; otherwise the attempt to select does.
+    options = _combo_options(combo)
+    if options and method not in options:
+        raise PaymentMethodUnavailable(method, options)
+    with tracing.step(f"set the invoice's payment method to {method!r}"):
+        tracing.point_at(combo)
+        try:
+            _select_option(combo, method)
+        except Exception as exc:
+            raise PaymentMethodUnavailable(method, options) from exc
+
+    shown = _payment_combo(editor).selected_text()
+    if shown != method:
+        raise ValueError(f"The invoice's payment method is {shown!r} after selecting {method!r}.")
+    return shown
+
+
+def set_invoice_paid(
+    editor: Any, paid: bool, payment_date: str | date | None = None, value: float | None = None
+) -> dict[str, Any]:
+    """Record whether the invoice has been paid (step 5.3).
+
+    Ticking "paid" changes the row: the due-days and pay-until fields it shows
+    while unpaid are replaced by the date the payment was made and its value.
+    So the box is ticked first, and only then are the other two touched.
+
+    An unpaid invoice is left alone entirely -- no date, no value. The
+    document says nothing about either, and a plausible-looking guess in a
+    payment record is worse than a blank.
+
+    Args:
+        editor (Any): The invoice editor.
+        paid (bool): Whether the document says it has been paid.
+        payment_date (str | date | None): When, if it has.
+        value (float | None): How much; the whole invoice, per the step.
+
+    Returns:
+        dict[str, Any]: What the payment row holds afterwards.
+
+    Raises:
+        ValueError: If the date or the value does not read back.
+    """
+    box = [c for c in editor.descendants(control_type="CheckBox") if c.element_info.name == PAID_LABEL][0]
+    if bool(box.get_toggle_state()) != paid:
+        with tracing.step(f"{'tick' if paid else 'clear'} {PAID_LABEL!r}"):
+            tracing.point_at(box)
+            box.iface_toggle.Toggle()
+            time.sleep(RESULTS_POLL_SECONDS)
+    if not paid:
+        return {"paid": False}
+
+    if payment_date:
+        wanted = date.fromisoformat(payment_date) if isinstance(payment_date, str) else payment_date
+        with tracing.step(f"set the payment date to {wanted.isoformat()}"):
+            _type_date(_payment_date_field(editor), wanted)
+        shown = _payment_date_field(editor).get_value()
+        if datetime.strptime(shown, DATE_DISPLAY_FORMAT).date() != wanted:
+            raise ValueError(f"The payment date reads {shown!r} after entering {wanted.isoformat()}.")
+
+    if value is not None and money(_field(editor, PAID_VALUE_LABEL).get_value()) != round(value, 2):
+        with tracing.step(f"set the paid value to {value:.2f}"):
+            _set_text(editor, PAID_VALUE_LABEL, f"{value:.2f}")
+        if money(_field(editor, PAID_VALUE_LABEL).get_value()) != round(value, 2):
+            raise ValueError(
+                f"{PAID_VALUE_LABEL} reads {_field(editor, PAID_VALUE_LABEL).get_value()!r}, expected {value:.2f}."
+            )
+
+    return {
+        "paid": True,
+        "method": _payment_combo(editor).selected_text(),
+        "date": _payment_date_field(editor).get_value(),
+        "value": _field(editor, PAID_VALUE_LABEL).get_value(),
+    }
+
+
+def _payment_date_field(editor: Any) -> Any:
+    """The date beside "at" on a paid invoice's payment row.
+
+    Args:
+        editor (Any): The invoice editor.
+
+    Returns:
+        Any: The date widget.
+
+    Raises:
+        LookupError: If the row does not show one, which it does not until
+            the invoice is marked paid.
+    """
+    return _field(editor, PAID_AT_LABEL)
+
+
+def invoice_payment(editor: Any) -> dict[str, Any]:
+    """What an invoice's payment row records.
+
+    Args:
+        editor (Any): The invoice editor.
+
+    Returns:
+        dict[str, Any]: Whether it is paid, and by what method, when and for
+            how much. The date and value only exist once it is marked paid.
+    """
+    box = [c for c in editor.descendants(control_type="CheckBox") if c.element_info.name == PAID_LABEL][0]
+    paid = bool(box.get_toggle_state())
+    record: dict[str, Any] = {"paid": paid, "method": _payment_combo(editor).selected_text()}
+    if paid:
+        record["date"] = _payment_date_field(editor).get_value()
+        record["value"] = _field(editor, PAID_VALUE_LABEL).get_value()
+    return record
+
+
+def confirm_saved_invoice(
+    win: WindowSpecification,
+    number: str,
+    method: str | None = None,
+    paid: bool = False,
+    payment_date: str | date | None = None,
+    value: float | None = None,
+) -> dict[str, Any]:
+    """Confirm what the saved invoice actually holds (step 5.6).
+
+    Reopened only if it has to be: while its editor is still open, that editor
+    is the saved record and reading it proves the same thing. Once it has been
+    closed, the record is fetched back from Data > Documents -- which is the
+    stronger check of the two, since it comes from the database rather than
+    from the form we typed into.
+
+    Args:
+        win (WindowSpecification): The main window.
+        number (str): The invoice's number.
+        method (str | None): The payment method it should carry.
+        paid (bool): Whether it should be marked paid.
+        payment_date (str | date | None): The date it should record.
+        value (float | None): The amount it should record.
+
+    Returns:
+        dict[str, Any]: The payment row as saved.
+
+    Raises:
+        ManualReviewRequired: If the saved invoice does not hold what was
+            entered, or cannot be found at all.
+    """
+    try:
+        editor = activate_editor(win, rf"^\*?{re.escape(number)}$", number)
+    except LookupError:
+        with tracing.step(f"reopen {number}"):
+            view = widen_view(win, DOCUMENTS_VIEW)
+            rows = [r for r in search_list(view, number) if _cell_matches(r.get(DOCUMENT_COLUMN), number)]
+            if not rows:
+                raise ManualReviewRequired(f"The saved invoice {number!r} is not in {DOCUMENTS_VIEW}", [])
+            editor = open_row(win, view, rows[0], number)
+            unwiden_view(win, DOCUMENTS_VIEW)
+
+    record = invoice_payment(editor)
+    wanted: dict[str, Any] = {"paid": paid}
+    if method:
+        wanted["method"] = method
+    if paid and payment_date:
+        wanted["date"] = _shown_date(payment_date) if isinstance(payment_date, str) else payment_date.strftime(DATE_DISPLAY_FORMAT)
+    if paid and value is not None:
+        wanted["value"] = value
+
+    complaints = []
+    for name, expected in wanted.items():
+        shown = record.get(name)
+        agrees = money(shown) == round(expected, 2) if name == "value" else shown == expected
+        if not agrees:
+            complaints.append(f"{name} reads {shown!r}, expected {expected!r}")
+    if complaints:
+        raise ManualReviewRequired(f"The saved invoice {number!r} does not hold: " + "; ".join(complaints), [])
+    return record
 
 
 def dismiss_dialog(dialog: Any, button: str) -> None:
@@ -2799,6 +3264,7 @@ DEMO_COMPANY = "Northstar Office GmbH"
 DEMO_CONTACT_NAME = "Marta Klein"
 DEMO_ALIAS = "NORTHSTAR-BERLIN"
 DEMO_PAYMENT_METHOD = "Bank Transfer"
+DEMO_PAYMENT_DATE = "2026-07-18"
 DEMO_STREET = "Friedrichstrasse 88"
 DEMO_POSTCODE = "10117"
 DEMO_CITY = "Berlin"
@@ -3050,6 +3516,44 @@ if __name__ == "__main__":
         order_editor = activate_editor(window, rf"^\*?{number}$", number)
         invoice_editor = create_follow_up(window, order_editor)
         print("invoice editor:", invoice_editor.element_info.name)
-        print("order saved and its invoice opened; nothing else is filed.")
+        # --- 5.1-5.6: the invoice the order raised, checked and settled ---
+        print("invoice carries:", confirm_invoice_from_order(window, number))
+        invoice_editor = activate_editor(window, NEW_INVOICE_TAB_RE, "New Invoice")
+        set_invoice_payment(invoice_editor, DEMO_PAYMENT_METHOD)
+        print(
+            "payment row:",
+            set_invoice_paid(
+                invoice_editor,
+                paid=True,
+                payment_date=DEMO_PAYMENT_DATE,
+                value=DEMO_TOTALS["gross"],
+            ),
+        )
+        invoice_number = save_invoice(window, invoice_editor)
+        print("invoice saved as:", invoice_number)
+        for document, row in confirm_documents(
+            window,
+            {
+                invoice_number: dict(state=PAID_STATE, total=f"{DEMO_TOTALS['gross']:.2f}",
+                                     reference=DEMO_EXTERNAL_REFERENCE),
+                number: dict(state=OPEN_STATE, total=f"{DEMO_TOTALS['gross']:.2f}",
+                             reference=DEMO_EXTERNAL_REFERENCE),
+            },
+        ).items():
+            print(f"{document}: {row.cells}")
+        print(
+            "saved invoice holds:",
+            confirm_saved_invoice(
+                window,
+                invoice_number,
+                method=DEMO_PAYMENT_METHOD,
+                paid=True,
+                payment_date=DEMO_PAYMENT_DATE,
+                value=DEMO_TOTALS["gross"],
+            ),
+        )
+
+        # 5.7: the flow ends here. No Delivery, Correction or Dunning.
+        print(f"done: order {number}, invoice {invoice_number}. Nothing further is created.")
     finally:
         tracing.stop()

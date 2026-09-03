@@ -23,6 +23,9 @@ from models import PostalAddress, SalesOrder, gross_price, line_total, parse_pos
 from sales_order import extract_sales_order
 
 
+#: What the document says in Paid Status when it has been settled.
+PAID_STATUS = "paid"
+
 #: Document to read when none is named on the command line.
 DEFAULT_DOCUMENT = "invoice.pdf"
 
@@ -380,7 +383,7 @@ def finish_order(win: object, order_editor: object, order: SalesOrder) -> object
         order (SalesOrder): The extracted order.
 
     Returns:
-        object: The linked invoice editor, left open for the next stage.
+        tuple[str, object]: The order's number, and the linked invoice editor.
 
     Raises:
         fakturama.ManualReviewRequired: If the order does not add up to what
@@ -411,7 +414,81 @@ def finish_order(win: object, order_editor: object, order: SalesOrder) -> object
     order_editor = fakturama.activate_editor(win, rf"^\*?{number}$", number)
     invoice_editor = fakturama.create_follow_up(win, order_editor)
     print(f"invoice editor: {invoice_editor.element_info.name}", flush=True)
-    return invoice_editor
+    return number, invoice_editor
+
+
+def settle_invoice(win: object, invoice_editor: object, order: SalesOrder, number: str) -> str:
+    """Check the invoice, record its payment and file it (steps 5.1-5.7).
+
+    Ends the flow. Nothing here raises a Delivery, a Correction or a Dunning:
+    the invoice is the last document this import creates.
+
+    Args:
+        win (object): The main window.
+        invoice_editor (object): The invoice raised from the order.
+        order (SalesOrder): The extracted order.
+        number (str): The saved order's number.
+
+    Returns:
+        str: The invoice's number.
+
+    Raises:
+        fakturama.ManualReviewRequired: If the invoice did not inherit the
+            order's content, or does not read back as saved.
+    """
+    # 5.1: everything the follow-up should have brought across.
+    fakturama.confirm_invoice_from_order(win, number)
+
+    invoice_editor = fakturama.activate_editor(win, fakturama.NEW_INVOICE_TAB_RE, "New Invoice")
+
+    # 5.2: the document's payment method, confirmed or set.
+    if order.payment_method:
+        fakturama.set_invoice_payment(invoice_editor, order.payment_method)
+
+    # 5.3: paid only when the document says so, and then in full.
+    paid = (order.paid_status or "").strip().casefold() == PAID_STATUS
+    print(
+        fakturama.set_invoice_paid(
+            invoice_editor,
+            paid=paid,
+            payment_date=order.payment_date if paid else None,
+            value=order.gross_total if paid else None,
+        ),
+        flush=True,
+    )
+
+    # 5.4: save, once.
+    invoice_number = fakturama.save_invoice(win, invoice_editor)
+    print(f"invoice saved as {invoice_number}", flush=True)
+
+    # 5.5: the invoice paid, and the order it came from still open.
+    reference = order.external_reference
+    total = f"{order.gross_total:.2f}" if order.gross_total is not None else None
+    rows = fakturama.confirm_documents(
+        win,
+        {
+            invoice_number: dict(
+                state=fakturama.PAID_STATE if paid else None, total=total, reference=reference
+            ),
+            number: dict(state=fakturama.OPEN_STATE, total=total, reference=reference),
+        },
+    )
+    for document, row in rows.items():
+        print(f"{document}: {row.cells}", flush=True)
+
+    # 5.6: and what the invoice itself holds, reopened only if it has to be.
+    print(
+        fakturama.confirm_saved_invoice(
+            win,
+            invoice_number,
+            method=order.payment_method,
+            paid=paid,
+            payment_date=order.payment_date if paid else None,
+            value=order.gross_total if paid else None,
+        ),
+        flush=True,
+    )
+    return invoice_number
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -462,8 +539,9 @@ def main(path: str) -> None:
     billing = parse_postal_address(order.billing_address, order.company)
     order_editor = select_debtor(window, order_editor, order, billing)
     order_editor = select_products(window, order_editor, order)
-    finish_order(window, order_editor, order)
-    print("order saved and its invoice opened; nothing else is filed.", flush=True)
+    number, invoice_editor = finish_order(window, order_editor, order)
+    invoice_number = settle_invoice(window, invoice_editor, order, number)
+    print(f"done: order {number}, invoice {invoice_number}. Nothing further is created.", flush=True)
 
 
 if __name__ == "__main__":
