@@ -2052,11 +2052,39 @@ def set_item_cell(editor: Any, line: table.Row, column: str, value: str) -> None
         win32gui.PostMessage(box.element_info.handle, win32con.WM_KEYUP, win32con.VK_RETURN, 0)
         time.sleep(RESULTS_POLL_SECONDS)
 
+    def write_and_check() -> None:
+        """Fill the cell, and read the table back to see that it took."""
+        open_and_write()
+        shown = _cell_now(editor, line, column)
+        wanted = money(value)
+        if shown is None or wanted is None or abs(shown) != abs(wanted):
+            raise ValueError(f"{column} reads {shown!r} after entering {value!r}.")
+
     # The editor belongs to the click that made it: once it goes, so does the
-    # handle we were writing through. Retrying the whole gesture -- click,
-    # find, write -- outlasts a cell that closed under us mid-redraw.
+    # handle we were writing through. And a value can land in the cell as raw
+    # text without the app taking it -- the table still says "10" while the
+    # line total ignores it. So the whole gesture is repeated until the table
+    # itself shows the number: click, find, write, read back.
     with tracing.step(f"set {column} to {value}"):
-        _retry(open_and_write)
+        _retry(write_and_check)
+
+
+def _cell_now(editor: Any, line: table.Row, column: str) -> float | None:
+    """Re-read one cell of an item line as a number.
+
+    Args:
+        editor (Any): The order or invoice editor.
+        line (table.Row): The line, for its position.
+        column (str): The column to read.
+
+    Returns:
+        float | None: What the cell shows, or None if it cannot be read.
+    """
+    lines, _, _ = read_items(editor, to_end=True)
+    if not lines:
+        return None
+    nearest = min(lines, key=lambda row: abs(row.y - line.y))
+    return money(nearest.get(column))
 
 
 def _column_x(columns: dict[str, float], name: str) -> float | None:
@@ -2157,7 +2185,7 @@ def item_line(editor: Any, sku: str) -> table.Row | None:
     return None
 
 
-def _shown_date(iso_date: str) -> str:
+def shown_date(iso_date: str) -> str:
     """An ISO date as Fakturama prints it in a list ("2026-07-14" -> "Jul 14, 2026").
 
     Args:
@@ -2167,6 +2195,74 @@ def _shown_date(iso_date: str) -> str:
         str: The same date, formatted the way the app displays it.
     """
     return date.fromisoformat(iso_date).strftime(DATE_DISPLAY_FORMAT)
+
+
+def field_value(editor: Any, label: str, index: int = 0) -> str:
+    """What a labelled box on a form currently holds.
+
+    The reading half of `_set_text`, for confirming a form rather than
+    filling it -- which is what the verification steps and the smoke run do.
+
+    Args:
+        editor (Any): An editor pane.
+        label (str): The box's label.
+        index (int): Which box, when one label covers several.
+
+    Returns:
+        str: The value, as the app displays it.
+    """
+    return _fields(editor, label)[index].get_value()
+
+
+def field_values(editor: Any, label: str) -> list[str]:
+    """What every box under one label holds, left to right.
+
+    Args:
+        editor (Any): An editor pane.
+        label (str): The label they share, e.g. "First Name Last Name".
+
+    Returns:
+        list[str]: Their values.
+    """
+    return [field.get_value() for field in _fields(editor, label)]
+
+
+def combo_value(editor: Any, label: str) -> str:
+    """Which option a labelled combo is on.
+
+    Args:
+        editor (Any): An editor pane.
+        label (str): The combo's label.
+
+    Returns:
+        str: The selected option.
+    """
+    return _field(editor, label, control_type="ComboBox").selected_text()
+
+
+def price_mode(editor: Any) -> str:
+    """Whether a document is priced Net or Gross.
+
+    Args:
+        editor (Any): An order or invoice editor.
+
+    Returns:
+        str: The header row's price mode.
+    """
+    return _price_mode_combo(editor).selected_text()
+
+
+def count_editors(win: WindowSpecification, title_re: str) -> int:
+    """How many editors of one kind are open.
+
+    Args:
+        win (WindowSpecification): The main window.
+        title_re (str): Pattern matching their tabs.
+
+    Returns:
+        int: The number open.
+    """
+    return _tab_count(win, title_re)
 
 
 def order_totals(editor: Any) -> dict[str, float | None]:
@@ -2360,17 +2456,26 @@ def confirm_documents(win: WindowSpecification, expected: dict[str, dict[str, st
     """
     widen_view(win, DOCUMENTS_VIEW)
     try:
-        return {number: confirm_document_row(win, number, **columns) for number, columns in expected.items()}
+        return {
+            number: confirm_document_row(win, number, widen=False, **columns)
+            for number, columns in expected.items()
+        }
     finally:
         unwiden_view(win, DOCUMENTS_VIEW)
 
 
-def confirm_document_row(win: WindowSpecification, number: str, **expected: str | None) -> table.Row:
+def confirm_document_row(
+    win: WindowSpecification, number: str, widen: bool = True, **expected: str | None
+) -> table.Row:
     """Find the saved order in Data > Documents and check it (step 4.5).
 
     Args:
         win (WindowSpecification): The main window.
         number (str): The order's number, as `save_order` returned it.
+        widen (bool): Give the list the whole window first. On by default,
+            because a list sharing the window truncates its columns to the
+            point where even the document number does not match; pass False
+            when the caller has already widened it.
         **expected (str | None): Columns to check, keyed as in
             `DOCUMENT_MATCH_COLUMNS` -- date, reference, state, total.
 
@@ -2381,8 +2486,12 @@ def confirm_document_row(win: WindowSpecification, number: str, **expected: str 
         ManualReviewRequired: If the order is not listed once, or a column
             disagrees with what was entered.
     """
-    view = open_list_view(win, DOCUMENTS_VIEW)
-    rows = [row for row in search_list(view, number) if _cell_matches(row.get(DOCUMENT_COLUMN), number)]
+    view = widen_view(win, DOCUMENTS_VIEW) if widen else open_list_view(win, DOCUMENTS_VIEW)
+    try:
+        rows = [row for row in search_list(view, number) if _cell_matches(row.get(DOCUMENT_COLUMN), number)]
+    finally:
+        if widen:
+            unwiden_view(win, DOCUMENTS_VIEW)
     if len(rows) != 1:
         raise ManualReviewRequired(f"{len(rows)} documents are numbered {number!r}", rows)
 
@@ -2730,7 +2839,7 @@ def confirm_saved_invoice(
     if method:
         wanted["method"] = method
     if paid and payment_date:
-        wanted["date"] = _shown_date(payment_date) if isinstance(payment_date, str) else payment_date.strftime(DATE_DISPLAY_FORMAT)
+        wanted["date"] = shown_date(payment_date) if isinstance(payment_date, str) else payment_date.strftime(DATE_DISPLAY_FORMAT)
     if paid and value is not None:
         wanted["value"] = value
 
@@ -3050,6 +3159,18 @@ def _wait_for_pick(handle: int, dialog: Any, timeout: int = RESULTS_TIMEOUT) -> 
 
 
 def _grab(ctrl: Any) -> Image.Image:
+    """Capture a control, retrying a refusal that means "not now".
+
+    Args:
+        ctrl (Any): A control with a native window handle.
+
+    Returns:
+        Image.Image: The control as an RGB image.
+    """
+    return _retry(lambda: _grab_once(ctrl))
+
+
+def _grab_once(ctrl: Any) -> Image.Image:
     """Capture a control's own pixels, even when another window covers it.
 
     A screen grab of a background window returns whatever is on top of it, so
@@ -3252,308 +3373,3 @@ def search_list(container: Any, term: str) -> list[table.Row]:
         settled = wait_for_results(container)
     tracing.point_at(_list_pane(container), colour=tracing.CONFIRM)
     return table.read(settled)
-
-
-#: Values the smoke run below drives the UI with. They are what
-#: `extract_sales_order("invoice.pdf")` returns, hardcoded so that running
-#: this module exercises the app without paying for OCR first; `main.py` runs
-#: the same steps on freshly extracted data.
-DEMO_ORDER_DATE = "2026-07-14"
-DEMO_EXTERNAL_REFERENCE = "WEB-2026-0714-A17"
-DEMO_COMPANY = "Northstar Office GmbH"
-DEMO_CONTACT_NAME = "Marta Klein"
-DEMO_ALIAS = "NORTHSTAR-BERLIN"
-DEMO_PAYMENT_METHOD = "Bank Transfer"
-DEMO_PAYMENT_DATE = "2026-07-18"
-DEMO_STREET = "Friedrichstrasse 88"
-DEMO_POSTCODE = "10117"
-DEMO_CITY = "Berlin"
-DEMO_COUNTRY = "Germany"
-DEMO_EMAIL = "marta.klein@example.test"
-DEMO_PHONE = "+49 30 5550 1420"
-
-
-#: What the document's own totals come to, for the check in step 4.3.
-DEMO_TOTALS = {"net": 570.00, "vat": 108.30, "gross": 678.30}
-
-#: The document's item lines, as extraction reads them off invoice.pdf. The
-#: gross price and line total are what steps 3.9 and 3.16 work out from the
-#: rest; they are spelled out here so the smoke run can check the app's
-#: arithmetic without importing the rules it is checking.
-DEMO_ITEMS = (
-    {
-        "sku": "CHR-ERG-01",
-        "description": "Ergonomic Desk Chair",
-        "qty": 2,
-        "unit_price": 250.00,
-        "discount_pct": 10,
-        "vat_pct": 19,
-        "gross_price": 297.50,
-        "line_total": 450.00,
-    },
-    {
-        "sku": "MAT-DESK-02",
-        "description": "Anti-Fatigue Desk Mat",
-        "qty": 3,
-        "unit_price": 40.00,
-        "discount_pct": 0,
-        "vat_pct": 19,
-        "gross_price": 47.60,
-        "line_total": 120.00,
-    },
-)
-
-
-if __name__ == "__main__":
-    # The whole workflow against the running app, on the values extraction
-    # reads off invoice.pdf:
-    #
-    #   python fakturama.py
-    #
-    # Same steps as `main.py`, minus the ~25s of OCR, and printing what the
-    # app holds after each one. It leaves the order open and unsaved, as the
-    # steps require -- nothing files the order itself.
-    tracing.configure(visual=True)
-    try:
-        window = connect()
-        print("connected:", window.element_info.name)
-        # The item table's right-hand columns are only readable at full width.
-        maximize(window)
-
-        # --- 1.3-1.7: a new order, with its header filled in ---------------
-        order_editor = open_new_order(window)
-        print("editor:", order_editor.element_info.name)
-        set_date(order_editor, DEMO_ORDER_DATE)
-        print("date:", _field(order_editor, "Date").get_value())
-        set_customer_reference(order_editor, DEMO_EXTERNAL_REFERENCE)
-        print("cust.ref:", _field(order_editor, CUSTOMER_REFERENCE_LABEL).get_value())
-        set_price_mode(order_editor)
-        set_vat_mode(order_editor)
-        print("price mode:", _price_mode_combo(order_editor).selected_text())
-        print("vat:", _field_combo(order_editor, "VAT").selected_text())
-
-        # --- 2.1-2.3: look the debtor up from the order, and decide --------
-        first_name, last_name = split_contact_name(DEMO_CONTACT_NAME)
-        criteria = dict(
-            company=DEMO_COMPANY,
-            first_name=first_name,
-            last_name=last_name,
-            postcode=DEMO_POSTCODE,
-            city=DEMO_CITY,
-        )
-        dialog = open_address_selector(order_editor, window)
-        debtor = find_debtor(dialog, DEMO_COMPANY, **criteria)
-        print("existing debtor:", debtor.cells if debtor else "none -- create one")
-
-        if not debtor:
-            dismiss_dialog(dialog, "Cancel")
-
-            # --- 2.5: the debtor editor, beside the still-open order -------
-            debtor_editor = open_new_debtor(window)
-            print("debtor editor:", debtor_editor.element_info.name)
-
-            # 2.6: identity, leaving the proposed Customer ID and "---" alone.
-            set_debtor_identity(debtor_editor, company=DEMO_COMPANY, contact_name=DEMO_CONTACT_NAME)
-            print("customer id:", _field(debtor_editor, "Customer ID").get_value())
-            print("company:", _field(debtor_editor, "Company").get_value())
-            print("name:", [c.get_value() for c in _fields(debtor_editor, NAME_LABEL)])
-            print("salutation:", _field(debtor_editor, "Salutation", control_type="ComboBox").selected_text())
-
-            # 2.7: the billing address. `main.py` splits the extracted
-            # one-liner into these parts with `models.parse_postal_address`.
-            set_main_address(
-                debtor_editor,
-                street=DEMO_STREET,
-                postcode=DEMO_POSTCODE,
-                city=DEMO_CITY,
-                country=DEMO_COUNTRY,
-                email=DEMO_EMAIL,
-                phone=DEMO_PHONE,
-            )
-            print("street:", _field(debtor_editor, "Street").get_value())
-            print("zip/city:", [c.get_value() for c in _fields(debtor_editor, POSTCODE_CITY_LABEL)])
-            print("country:", _field(debtor_editor, "Country", control_type="ComboBox").selected_text())
-            print("email:", _field(debtor_editor, "E-Mail").get_value())
-            print("phone:", _field(debtor_editor, "Telephone").get_value())
-
-            # 2.8: the invoice address. It would take the delivery role too if
-            # the document's two addresses were the same place -- `main.py`
-            # decides that with `models.same_address`; this document's differ.
-            set_address_roles(debtor_editor, invoice=True, delivery=False)
-            print("address type:", _field(debtor_editor, ADDRESS_TYPE_LABEL).get_value())
-
-            # 2.9: alias, no discount, prices net.
-            set_debtor_miscellaneous(debtor_editor, alias=DEMO_ALIAS)
-            print("alias:", _field(debtor_editor, ALIAS_LABEL).get_value())
-            print("discount:", _field(debtor_editor, DISCOUNT_LABEL).get_value())
-            print("net or gross:", _field(debtor_editor, NET_GROSS_LABEL, control_type="ComboBox").selected_text())
-
-            # 2.10: the payment method, creating it if this install lacks it.
-            try:
-                set_debtor_payment(debtor_editor, DEMO_PAYMENT_METHOD)
-            except PaymentMethodUnavailable as unavailable:
-                print("payment: needs creating --", unavailable)
-
-                # 2.10.1-2.10.2: it may exist without being offered here yet.
-                if not find_payment_method(window, DEMO_PAYMENT_METHOD):
-                    # 2.10.3-2.10.5: fill it in. Saving is 2.10.6.
-                    term_editor = create_payment_method(window, DEMO_PAYMENT_METHOD)
-                    print("new term:", _field(term_editor, "Name").get_value())
-                    print(
-                        "payment code:",
-                        _field(term_editor, PAYMENT_CODE_LABEL, control_type="ComboBox").selected_text().strip(),
-                    )
-                    print(
-                        "zeros:",
-                        [_field(term_editor, label).get_value() for label in (CASH_DISCOUNT_LABEL, *DAY_LABELS)],
-                    )
-                    save_editor(window, NEW_TERM_TAB_RE, "New Term of Payment")
-
-                debtor_editor = activate_editor(window, NEW_DEBTOR_TAB_RE, "New Debtor")
-                set_debtor_payment(debtor_editor, DEMO_PAYMENT_METHOD)
-            print("payment:", _field(debtor_editor, PAYMENT_LABEL, control_type="ComboBox").selected_text())
-
-            # 2.11: save the debtor, once.
-            save_editor(window, NEW_DEBTOR_TAB_RE, "New Debtor")
-            print("debtor saved as:", _field(debtor_editor, "Customer ID").get_value())
-
-            # 2.12: back to the order, and pick the debtor we just saved.
-            order_editor = activate_editor(window, NEW_ORDER_TAB_RE, "New Order")
-            dialog = open_address_selector(order_editor, window)
-            debtor = find_debtor(dialog, DEMO_COMPANY, **criteria)
-            if not debtor:
-                dismiss_dialog(dialog, "Cancel")
-                raise ManualReviewRequired(
-                    f"The debtor was saved but does not come back when searching for {DEMO_COMPANY!r}", []
-                )
-
-        # --- 2.4 / 2.13: use the debtor, and check what the order got ------
-        choose_row(dialog, debtor)
-        order_editor = activate_editor(window, NEW_ORDER_TAB_RE, "New Order")
-        filled = confirm_order_addresses(
-            order_editor,
-            {ROLE_INVOICE: [DEMO_COMPANY, DEMO_STREET, DEMO_POSTCODE, DEMO_CITY, DEMO_COUNTRY]},
-        )
-        for role, text in filled.items():
-            print(f"{role}: {text!r}")
-        print("addresses confirmed against the document")
-
-        # --- 3.1-3.17: every item line, in the document's order ------------
-        for position, item in enumerate(DEMO_ITEMS, start=1):
-            sku, description = item["sku"], item["description"]
-
-            # 3.2-3.3: pick the product from the order, if it is there.
-            if not select_product(order_editor, window, sku):
-                print(f"item {position}: no product {sku!r} -- creating one")
-
-                # 3.4-3.6: the VAT rate first, so the product editor offers it.
-                if not find_vat(window, item["vat_pct"]):
-                    create_vat(window, item["vat_pct"])
-                    save_editor(window, NEW_VAT_TAB_RE, "New TAX Rate")
-                    print(f"  created the {vat_name(item['vat_pct'])} rate")
-
-                # 3.7-3.10: the product itself. `main.py` works the gross
-                # price out with `models.gross_price`.
-                product_editor = create_product(
-                    window,
-                    sku=sku,
-                    description=description,
-                    price=item["gross_price"],
-                    vat=vat_name(item["vat_pct"]),
-                )
-                print("  item number:", _field(product_editor, "Item Number").get_value())
-                print("  price (gross):", _field(product_editor, GROSS_PRICE_LABEL).get_value())
-                print("  vat:", _field(product_editor, "VAT", control_type="ComboBox").selected_text())
-
-                # 3.11: save, once.
-                save_editor(window, NEW_PRODUCT_TAB_RE, "New product")
-
-                # 3.12: back to the order, and pick what we just saved.
-                order_editor = activate_editor(window, NEW_ORDER_TAB_RE, "New Order")
-                if not select_product(order_editor, window, sku):
-                    raise ManualReviewRequired(
-                        f"Product {sku!r} was saved but the picker still does not offer it", []
-                    )
-
-            # 3.13-3.15: the quantity and discount this transaction was given.
-            order_editor = activate_editor(window, NEW_ORDER_TAB_RE, "New Order")
-            line = find_item_line(order_editor, sku)
-            if line is None:
-                raise ManualReviewRequired(f"No order line for {sku!r} to complete", [])
-            set_item_cell(order_editor, line, QTY_COLUMN, f"{item['qty']:g}")
-            if item["discount_pct"]:
-                set_item_cell(order_editor, line, LINE_DISCOUNT_COLUMN, f"{item['discount_pct']:g}")
-
-            # 3.14 and 3.16: what the product brought with it, and the total.
-            filled_line = item_line(order_editor, sku)
-            print(f"item {position}: {filled_line.cells if filled_line else 'unreadable'}")
-            price = money(filled_line.get(LINE_PRICE_COLUMN)) if filled_line else None
-            if price != item["line_total"]:
-                raise ManualReviewRequired(
-                    f"Line {position} comes to {price!r}, the document says {item['line_total']:.2f}", []
-                )
-
-        # --- 4.1-4.3: nothing of the order's own, and totals that agree ----
-        confirm_order_charges(order_editor)
-        print("totals:", confirm_order_totals(order_editor, **DEMO_TOTALS))
-
-        # --- 4.4-4.5: save it, then read it back from Data > Documents -----
-        number = save_order(window, order_editor)
-        print("saved as:", number)
-        print(
-            "documents:",
-            confirm_document_row(
-                window,
-                number,
-                date=_shown_date(DEMO_ORDER_DATE),
-                reference=DEMO_EXTERNAL_REFERENCE,
-                state=OPEN_STATE,
-                total=f"{DEMO_TOTALS['gross']:.2f}",
-            ).cells,
-        )
-
-        # --- 4.6-4.7: the invoice, raised from the order to keep the link --
-        order_editor = activate_editor(window, rf"^\*?{number}$", number)
-        invoice_editor = create_follow_up(window, order_editor)
-        print("invoice editor:", invoice_editor.element_info.name)
-        # --- 5.1-5.6: the invoice the order raised, checked and settled ---
-        print("invoice carries:", confirm_invoice_from_order(window, number))
-        invoice_editor = activate_editor(window, NEW_INVOICE_TAB_RE, "New Invoice")
-        set_invoice_payment(invoice_editor, DEMO_PAYMENT_METHOD)
-        print(
-            "payment row:",
-            set_invoice_paid(
-                invoice_editor,
-                paid=True,
-                payment_date=DEMO_PAYMENT_DATE,
-                value=DEMO_TOTALS["gross"],
-            ),
-        )
-        invoice_number = save_invoice(window, invoice_editor)
-        print("invoice saved as:", invoice_number)
-        for document, row in confirm_documents(
-            window,
-            {
-                invoice_number: dict(state=PAID_STATE, total=f"{DEMO_TOTALS['gross']:.2f}",
-                                     reference=DEMO_EXTERNAL_REFERENCE),
-                number: dict(state=OPEN_STATE, total=f"{DEMO_TOTALS['gross']:.2f}",
-                             reference=DEMO_EXTERNAL_REFERENCE),
-            },
-        ).items():
-            print(f"{document}: {row.cells}")
-        print(
-            "saved invoice holds:",
-            confirm_saved_invoice(
-                window,
-                invoice_number,
-                method=DEMO_PAYMENT_METHOD,
-                paid=True,
-                payment_date=DEMO_PAYMENT_DATE,
-                value=DEMO_TOTALS["gross"],
-            ),
-        )
-
-        # 5.7: the flow ends here. No Delivery, Correction or Dunning.
-        print(f"done: order {number}, invoice {invoice_number}. Nothing further is created.")
-    finally:
-        tracing.stop()
