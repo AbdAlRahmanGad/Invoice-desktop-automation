@@ -1,0 +1,11 @@
+# Virtual environment and caches
+.venv/
+__pycache__/
+*.py[cod]
+
+# Editor settings
+.idea/
+.vscode/
+
+# Run output
+out.log

@@ -3,7 +3,7 @@
 #   uv venv --python 3.11 .venv && source .venv/bin/activate
 #   uv pip install -r requirements.txt
 #
-# --- Direct dependencies (7) -------------------------------------------
+# --- Direct dependencies (9) -------------------------------------------
 # paddleocr    text detection + recognition. PINNED <3: paddleocr 3.x pulls
 #              paddlex/PP-OCRv6 and crashes here with NotImplementedError
 #              (ConvertPirAttribute2RuntimeAttribute) -- verified, do not bump
@@ -19,6 +19,10 @@
 # pillow       loads/upscales image inputs.
 # numpy        image arrays.
 # pydantic     the SalesOrder/LineItem schema.
+# pywinauto    drives Fakturama through Microsoft UI Automation.
+# pywin32      the Win32 calls pywinauto does not wrap: posting clicks and
+#              keys to a control's own window, and PrintWindow captures of a
+#              window that another window is covering.
 # setuptools   NOT a build tool here: paddlepaddle imports it at runtime
 #              (paddle.utils.cpp_extension) and fails on import without it.
 numpy==2.4.6
@@ -27,6 +31,8 @@ paddlepaddle==2.6.2
 pillow==12.3.0
 pydantic==2.13.5
 pypdfium2==5.13.0
+pywinauto==0.6.9
+pywin32==312
 setuptools==84.0.0
 
 # --- Transitive, pinned for reproducibility (46) ---------------------
@@ -39,6 +45,7 @@ beautifulsoup4==4.15.0
 certifi==2026.7.22
 charset-normalizer==3.5.1
 colorama==0.4.6
+comtypes==1.4.16
 cython==3.3.0
 decorator==5.3.1
 fire==0.7.1
