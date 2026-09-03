@@ -40,14 +40,14 @@ using the values extraction returns for `invoice.pdf`.
 
 ## Modules
 
-| Module | Responsibility |
-|---|---|
-| `main.py` | Orchestrates the five stages; maps extracted fields to UI fields |
-| `smoke.py` | The same run on demo values, without OCR |
-| `fakturama.py` | Everything that talks to the application |
+| Module | Responsibility                                                                                                        |
+|---|-----------------------------------------------------------------------------------------------------------------------|
+| `main.py` | Orchestrates the five stages; maps extracted fields to UI fields                                                      |
+| `smoke.py` | The same run on demo values, without OCR                                                                              |
+| `fakturama.py` | Everything that talks to the application                                                                              |
 | `table.py` | Reads Fakturama's drawn lists (they have no accessibility tree) by OCR-ing a capture and cutting it on the grid lines |
-| `tracing.py` | The optional on-screen pointer and the step log |
-| `sales_order.py` | The document layout: which label means which field |
-| `layout.py` | Geometry — grouping positioned text into rows and columns |
-| `ocr.py` | The only module that knows about PaddleOCR |
-| `models.py` | The `SalesOrder` schema, and the rules over it (address parsing, gross price, line totals) |
+| `tracing.py` | The optional on-screen pointer and the step log                                                                       |
+| `sales_order.py` | The document layout: which label means which field                                                                    |
+| `layout.py` | Geometry, grouping positioned text into rows and columns                                                              |
+| `ocr.py` | The only module that knows about PaddleOCR                                                                            |
+| `models.py` | The `SalesOrder` schema, and the rules over it (address parsing, gross price, line totals)                            |
