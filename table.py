@@ -34,15 +34,28 @@ LINE_COVERAGE = 0.9
 #: under its header row.
 HEADER_BAND_FALLBACK = 0.05
 
+#: More separators than a list plausibly has means the header band was read
+#: as one dark smear -- a filled header does that -- so the boundaries are
+#: taken from the ruled body instead.
+MAX_COLUMNS = 12
+
 #: Inset, in scaled pixels, when cropping a cell out of the grid, so the
 #: crop holds the cell's text and none of its borders.
 CELL_INSET = 2
 
-#: Separator pixels this close together belong to the same line.
+#: Separator pixels this close together belong to the same line, and a line
+#: no thicker than this. Thickness is what distinguishes a rule from a filled
+#: band: a selected row is painted solid blue and a header is filled grey,
+#: both dark right across the table, and neither is a column or row boundary.
 LINE_GAP = 3
+MAX_LINE_THICKNESS = 5
 
 #: Row clustering tolerance, as a fraction of the capture's height.
 ROW_TOL_RATIO = 0.02
+
+#: How far above and below a row's text to read it when the table draws no
+#: rules to bound it, as a fraction of the distance between rows.
+UNRULED_BAND_RATIO = 0.35
 
 
 def column_edges(image: Any, band: tuple[int, int] | None = None) -> list[float]:
@@ -81,7 +94,7 @@ def _merge(positions: list[int]) -> list[float]:
             runs[-1].append(position)
         else:
             runs.append([position])
-    return [sum(run) / len(run) for run in runs]
+    return [sum(run) / len(run) for run in runs if len(run) <= MAX_LINE_THICKNESS]
 
 
 def _header_band(image: Any) -> tuple[int, int]:
@@ -100,11 +113,9 @@ def _header_band(image: Any) -> tuple[int, int]:
     """
     import numpy as np
 
-    grey = np.array(image.convert("L"), dtype=np.int16)
-    dark = (grey < LINE_GREY).sum(axis=1)
-    for y in range(image.height):
-        if dark[y] >= image.width * LINE_COVERAGE:
-            return 0, y
+    lines = row_lines(image)
+    if lines:
+        return 0, int(lines[0])
     return 0, int(image.height * HEADER_BAND_FALLBACK)
 
 
@@ -171,11 +182,20 @@ def _band_for(y: float, lines: list[float], height: int, spacing: float) -> tupl
     Returns:
         tuple[float, float]: Top and bottom of the row.
     """
+    # Never reach further than most of the way to the neighbouring row, ruled
+    # or not: when a rule between two rows goes undetected, the nearest one
+    # above can be the table's top border, and a band stretching back to it
+    # pulls the header's own words into the cell ("Qty. 1.00").
+    reach = abs(spacing) * UNRULED_BAND_RATIO
+    top, bottom = max(0.0, y - reach), min(float(height), y + reach)
+
     above = [line for line in lines if line < y]
     below = [line for line in lines if line > y]
-    if above and below:
-        return max(above), min(below)
-    return max(0.0, y - spacing / 2), min(float(height), y + spacing / 2)
+    if above:
+        top = max(top, max(above))
+    if below:
+        bottom = min(bottom, min(below))
+    return top, bottom
 
 
 def _column_of(x: float, edges: list[float]) -> int:
@@ -213,6 +233,31 @@ class Row:
         return default
 
 
+def header_positions(image: Any) -> dict[str, float]:
+    """Where each column's header sits, in the capture's own pixels.
+
+    Clicking a cell needs a position, and the ruled grid is not always
+    readable -- the order's item table paints a filled header over light
+    rules. The header text itself is unambiguous, so its words give the
+    columns their x, which is all a click needs: cells are far wider than the
+    error in a word's centre.
+
+    Args:
+        image (Any): A capture of the list, including its header row.
+
+    Returns:
+        dict[str, str]: Column name -> the x of its header, with the trailing
+            dot Fakturama puts on abbreviations ("Qty.", "Pos.") removed.
+    """
+    from PIL import Image
+
+    scaled = image.resize((image.width * SCALE, image.height * SCALE), Image.LANCZOS)
+    rows = cluster_rows(ocr.read_image(scaled), scaled.height * ROW_TOL_RATIO)
+    if not rows:
+        return {}
+    return {box.text.strip().rstrip("."): box.x / SCALE for box in rows[0] if box.text.strip()}
+
+
 def read(image: Any) -> list[Row]:
     """Read a captured list into rows.
 
@@ -236,8 +281,13 @@ def read(image: Any) -> list[Row]:
     from PIL import Image
 
     scaled = image.resize((image.width * SCALE, image.height * SCALE), Image.LANCZOS)
-    edges = column_edges(scaled, _header_band(scaled))
     lines = row_lines(scaled)
+    edges = column_edges(scaled, _header_band(scaled))
+    if not edges or len(edges) > MAX_COLUMNS:
+        # A grey-filled header (the Data lists paint one) is dark all the way
+        # across, so every pixel column in it looks like a rule. Those lists
+        # do rule their bodies, which is the more reliable place to measure.
+        edges = column_edges(scaled)
 
     # One pass over the whole list first: it names the columns, and says which
     # rows have anything in them. Only those rows are then read cell by cell,

@@ -23,6 +23,7 @@ from typing import Any
 
 import table
 import tracing
+from layout import normalize
 import win32api
 import win32con
 import win32gui
@@ -53,10 +54,26 @@ NEW_ORDER_TAB_RE = r"^\*?New Order$"
 #: The Addresses row's two icons: the upper one picks an existing contact,
 #: the lower green + starts a new one. We only ever want the upper (step 2.1),
 #: so the lookup insists on finding exactly this many and takes the topmost.
+ADDRESSES_LABEL = "Addresses"
 ADDRESS_ICON_COUNT = 2
 
 #: Modal that the upper icon opens.
 ADDRESS_DIALOG_TITLE = "Select the address"
+
+#: The Items table's four icons, top to bottom: pick a product, add a line
+#: (green +), delete a line, duplicate a line. Step 3.2 wants the first and
+#: explicitly not the second.
+ITEMS_LABEL = "Items"
+ITEM_ICON_COUNT = 4
+PRODUCT_DIALOG_TITLE = "Select a product"
+
+#: The product list's item-number column, which is what a SKU is matched
+#: against (step 3.3).
+SKU_COLUMN = "Item No."
+
+#: How long to give the product picker to close itself on a unique match
+#: before concluding that it is waiting for us instead.
+PICK_SETTLE_SECONDS = 1.5
 
 #: Seconds to wait for a modal dialog to appear.
 DIALOG_TIMEOUT = 10
@@ -79,9 +96,10 @@ DEBTOR_MATCH_COLUMNS = {
 }
 COMPANY_COLUMN = "Company"
 
-#: How a cell that is too narrow for its value ends, as the recogniser writes
-#: it. Matched on the visible part in that case.
-TRUNCATION_MARKS = ("...", "..", ".", "\u2026")
+#: How much of a cut-short cell has to be showing before its opening counts
+#: as recognising the value. Without a floor, "Ltd" would match half an
+#: address book.
+MIN_PREFIX_MATCH = 6
 
 #: Where along a row to click when selecting it, as a fraction of the list's
 #: width. Anywhere in the row will do; this keeps clear of the narrow marker
@@ -156,12 +174,60 @@ PAYMENT_CODES = {
     "SEPA Direct Debit": "SEPA direct debit",
 }
 
+#: Columns of the item table used to find and check a line.
+ITEM_NUMBER_COLUMN = "Item No"
+NAME_COLUMN = "Name"
+
+#: Seconds to let a resized window settle before reading it.
+WINDOW_SETTLE_SECONDS = 1.0
+
+#: The order's item table sits between these two labels, and its columns are
+#: named by their headers (steps 3.13-3.16). "Qty" and "Pos" lose the dot
+#: Fakturama prints after them.
+REMARKS_LABEL = "Remarks"
+QTY_COLUMN = "Qty"
+UNIT_PRICE_COLUMN = "U.Price"
+LINE_DISCOUNT_COLUMN = "Discount"
+LINE_PRICE_COLUMN = "Price"
+LINE_VAT_COLUMN = "VAT"
+
+#: Creating a product (steps 3.7-3.11). The gross price and cost price boxes
+#: carry no accessible name, so they are found beside their labels.
+NEW_PRODUCT_BUTTON = "Create a new product"
+NEW_PRODUCT_TAB_RE = r"^\*?New product$"
+GROSS_PRICE_LABEL = "Price (gross)"
+COST_PRICE_LABEL = "cost price (net)"
+STOCK_LABEL = "Stock"
+ZERO_AMOUNT = "0.00"
+
+#: The Data list holding VAT rates, and what a rate for an imported item is
+#: called there (steps 3.4-3.6). This install ships "MwSt. 19%", which is the
+#: same tax under a different name -- the steps want one named for its rate.
+VATS_VIEW = "VATs"
+VAT_NAME_PREFIX = "VAT"
+NEW_VAT_BUTTON = "Create a new tax rate"
+NEW_VAT_TAB_RE = r"^\*?New TAX Rate$"
+VAT_VALUE_LABEL = "Value"
+
+#: The e-invoice code a normal rate carries, which a new rate already has.
+VAT_CODE_LABEL = "VAT code (E-Invoice)"
+STANDARD_VAT_CODE = "S (Standard rate)"
+
+#: A number in displayed text, for reading a percentage back.
+_NUMBER_RE = re.compile(r"[-+]?\d*\.?\d+")
+
 #: The Data list holding payment methods (step 2.10.1).
 TERMS_OF_PAYMENT_VIEW = "terms of payment"
 
 #: The debtor's payment method (step 2.10). This install keeps it on the
 #: Miscellaneous tab rather than a Payment tab of its own.
 PAYMENT_LABEL = "Payment"
+
+#: How many times to repeat a UI Automation call that failed transiently, and
+#: how long to leave between tries. A dialog that has just appeared can refuse
+#: to be looked up for about a second, so the budget covers several of those.
+UIA_ATTEMPTS = 8
+UIA_RETRY_SECONDS = 0.5
 
 #: Seconds to wait for a dropped-down combo to fill in its options, and how
 #: many times to ask it to select one before giving up.
@@ -185,8 +251,10 @@ ROLE_DELIVERY = "Delivery address"
 #: Window class of Fakturama's dialogs and popups.
 DIALOG_CLASS = "#32770"
 
-#: Seconds to wait for a tab to come to the front.
+#: Seconds to wait for a tab to come to the front, and where along it to
+#: click -- well left of the close button on its right-hand end.
 TAB_TIMEOUT = 5
+TAB_CLICK_X = 0.25
 
 #: Tabs of the debtor editor that hold the billing address (step 2.7).
 ADDRESSES_TAB = "Addresses"
@@ -246,6 +314,14 @@ def connect() -> WindowSpecification:
             "module attaches to a running instance rather than launching one."
         ) from exc
     win = app.window(title_re=APP_TITLE_RE)
+    # A minimized window draws nothing: its controls report empty rectangles
+    # and it renders no pixels, so neither reading a list nor clicking a row
+    # can work. Restore it -- without taking the foreground, so whatever the
+    # user is doing keeps it.
+    handle = win.element_info.handle
+    if win32gui.IsIconic(handle):
+        win32gui.ShowWindow(handle, win32con.SW_RESTORE)
+
     # "visible", not "ready": a modal dialog disables the main window, and a
     # run that has to reopen the address selector legitimately attaches while
     # one is open.
@@ -718,8 +794,15 @@ def activate_tab(tab: Any) -> None:
     if not handle:
         raise LookupError(f"The tab folder holding {tab.element_info.name!r} has no window handle.")
     left, top, _, _ = win32gui.GetWindowRect(handle)
-    middle = tab.rectangle().mid_point()
-    position = win32api.MAKELONG(middle.x - left, middle.y - top)
+    # Aim at the tab's left end, not its middle: a selected tab carries a
+    # close button on its right, and on a crowded strip the middle is close
+    # enough to it to hit it -- which closes the editor and puts up a "Save
+    # Parts" prompt instead of switching to it.
+    rectangle = tab.rectangle()
+    position = win32api.MAKELONG(
+        int(rectangle.left + rectangle.width() * TAB_CLICK_X) - left,
+        rectangle.mid_point().y - top,
+    )
     win32gui.PostMessage(handle, win32con.WM_LBUTTONDOWN, win32con.MK_LBUTTON, position)
     win32gui.PostMessage(handle, win32con.WM_LBUTTONUP, 0, position)
 
@@ -753,7 +836,10 @@ def activate_editor(win: WindowSpecification, title_re: str, what: str) -> Any:
     tabs = [t for t in win.descendants(control_type="TabItem") if pattern.match(t.element_info.name or "")]
     if not tabs:
         raise LookupError(f"No {what} editor is open.")
-    tab = max(tabs, key=lambda t: t.rectangle().left)
+    # One of them may already be in front, in which case that is the one being
+    # worked on -- switching away from it to the newest would be wrong, and
+    # clicking a tab that the tab strip has scrolled out of reach fails anyway.
+    tab = next((t for t in tabs if t.is_selected()), max(tabs, key=lambda t: t.rectangle().left))
     if not tab.is_selected():
         with tracing.step(f"switch to the {what} editor"):
             activate_tab(tab)
@@ -1315,12 +1401,12 @@ def select_row(container: Any, row: table.Row) -> None:
             time.sleep(RESULTS_POLL_SECONDS)
 
 
-def choose_address(dialog: WindowSpecification, row: table.Row) -> None:
-    """Select a debtor in the address dialog and confirm it (step 2.12).
+def choose_row(dialog: Any, row: table.Row) -> None:
+    """Select a row in a picker dialog and confirm it (steps 2.12, 3.3).
 
     Args:
-        dialog (WindowSpecification): The Select the address dialog.
-        row (table.Row): The debtor's row.
+        dialog (WindowSpecification): The picker dialog.
+        row (table.Row): The row to choose.
     """
     select_row(dialog, row)
     dismiss_dialog(dialog, "OK")
@@ -1381,13 +1467,24 @@ def _cell_matches(visible: str, expected: str) -> bool:
     shown, wanted = visible.strip(), expected.strip()
     if not shown:
         return False
-    if shown.endswith(TRUNCATION_MARKS):
-        prefix = shown.rstrip(".… ")
-        return bool(prefix) and wanted.casefold().startswith(prefix.casefold())
-    return shown.casefold() == wanted.casefold()
+    if shown.casefold() == wanted.casefold():
+        return True
+
+    # A cell too narrow for its value is cut short, and the ellipsis marking
+    # that is not always read back -- "Northstar Office ..." comes back as
+    # "Northstar Office" whenever the crop lands a pixel tighter. So a shorter
+    # cell that begins the expected value counts, provided enough of it shows
+    # to mean something. The caller compares several columns, so an opening
+    # never decides a match on its own.
+    prefix = shown.rstrip(". …")
+    return (
+        len(prefix) >= MIN_PREFIX_MATCH
+        and len(prefix) < len(wanted)
+        and wanted.casefold().startswith(prefix.casefold())
+    )
 
 
-def find_debtor(dialog: WindowSpecification, term: str, **expected: str | None) -> table.Row | None:
+def find_debtor(dialog: Any, term: str, **expected: str | None) -> table.Row | None:
     """Search the address list and decide what it found (steps 2.2-2.3).
 
     A row counts as the document's customer only when every field the document
@@ -1418,7 +1515,16 @@ def find_debtor(dialog: WindowSpecification, term: str, **expected: str | None) 
     rows = search_list(dialog, term)
     exact = [row for row in rows if all(_cell_matches(row.get(c), v) for c, v in wanted.items())]
     if len(exact) > 1:
-        raise ManualReviewRequired(f"{len(exact)} debtors match the document", exact)
+        # Step 2.3 asks for manual review here; the instruction for this
+        # install is to take the first instead. Rows that match on all five
+        # fields describe the same customer entered twice, so either one
+        # points at the same person -- but it is said out loud, because the
+        # duplicate itself is worth someone's attention.
+        print(
+            f"note: {len(exact)} debtors match the document; using the first, "
+            f"{[row.get('No.') for row in exact]}",
+            flush=True,
+        )
     if exact:
         return exact[0]
 
@@ -1472,7 +1578,490 @@ def confirm_order_addresses(editor: Any, parts_by_role: dict[str, list[str]]) ->
     return shown
 
 
-def dismiss_dialog(dialog: WindowSpecification, button: str) -> None:
+def vat_name(percentage: float) -> str:
+    """The name a VAT rate must carry to be reusable (step 3.5).
+
+    Args:
+        percentage (float): The extracted VAT percentage, e.g. 19.0.
+
+    Returns:
+        str: "VAT 19%" -- whole rates without a decimal part, since that is
+            how the step writes them and how a person would type them.
+    """
+    rounded = round(percentage, 2)
+    figure = int(rounded) if rounded == int(rounded) else rounded
+    return f"{VAT_NAME_PREFIX} {figure}%"
+
+
+def percentage(text: str) -> float | None:
+    """Read a percentage out of what a field or a list cell shows.
+
+    Args:
+        text (str): Displayed value, e.g. "19.00 %" or "19%".
+
+    Returns:
+        float | None: The number, or None if there is none.
+    """
+    match = _NUMBER_RE.search(text.replace(",", "."))
+    return float(match.group()) if match else None
+
+
+def open_row(win: WindowSpecification, view: Any, row: table.Row, name: str) -> Any:
+    """Open a list row's record, and return its editor.
+
+    A drawn list has no rows to invoke, so the record is opened the way a
+    person opens it: a double-click on the row. The editor it opens is named
+    after the record.
+
+    Args:
+        win (WindowSpecification): The main window.
+        view (Any): The list view holding the row.
+        row (table.Row): The row to open.
+        name (str): The record's name, which its tab takes.
+
+    Returns:
+        Any: The record's editor.
+
+    Raises:
+        LookupError: If the list pane has no window handle.
+        TimeoutError: If no editor opens.
+    """
+    pane = _list_pane(view)
+    handle = getattr(pane.element_info, "handle", None)
+    if not handle:
+        raise LookupError("The list has no window handle to click.")
+    position = win32api.MAKELONG(int(pane.rectangle().width() * ROW_CLICK_X), int(row.y))
+    with tracing.step(f"open {name!r}"):
+        for message in (win32con.WM_LBUTTONDOWN, win32con.WM_LBUTTONUP, win32con.WM_LBUTTONDBLCLK, win32con.WM_LBUTTONUP):
+            flags = win32con.MK_LBUTTON if message != win32con.WM_LBUTTONUP else 0
+            win32gui.PostMessage(handle, message, flags, position)
+        return wait_for_editor(win, f"^\\*?{re.escape(name)}$", name)
+
+
+def find_vat(win: WindowSpecification, percentage: float) -> table.Row | None:
+    """Look up the VAT rate an item needs (steps 3.4-3.5).
+
+    A rate is only reusable when everything about it agrees with the
+    document: it is named for its percentage, its value *is* that percentage,
+    and it is filed as the standard rate. A rate of the right name whose value
+    or code says something else is a disagreement about tax, which is not
+    something to resolve by picking one.
+
+    Note that a rate with the right value under another name -- this install
+    ships "MwSt. 19%" -- is not a match and not a conflict either: step 3.6
+    creates the named one alongside it.
+
+    Args:
+        win (WindowSpecification): The main window.
+        percentage (float): The extracted VAT percentage.
+
+    Returns:
+        table.Row | None: The matching rate, or None if it has to be created.
+
+    Raises:
+        ManualReviewRequired: If a rate of that name disagrees about the
+            percentage or the e-invoice code, or several carry the name.
+    """
+    name = vat_name(percentage)
+    view = open_list_view(win, VATS_VIEW)
+    rows = search_list(view, name)
+    named = [row for row in rows if _cell_matches(row.get("Name"), name)]
+    if not named:
+        return None
+    if len(named) > 1:
+        raise ManualReviewRequired(f"{len(named)} VAT rates are called {name!r}", named)
+
+    row = named[0]
+    value = percentage(row.get("Value"))
+    if value != percentage:
+        raise ManualReviewRequired(f"{name!r} is worth {row.get('Value')!r}, not {percentage}%", [row])
+
+    editor = open_row(win, view, row, name)
+    code = _field(editor, VAT_CODE_LABEL, control_type="ComboBox").selected_text()
+    if code != STANDARD_VAT_CODE:
+        raise ManualReviewRequired(f"{name!r} is coded {code!r}, not {STANDARD_VAT_CODE!r}", [row])
+    return row
+
+
+def create_vat(win: WindowSpecification, percentage: float) -> Any:
+    """Fill in a new VAT rate for `percentage` (step 3.6).
+
+    Leaves the editor unsaved for the caller to save, and does not touch the
+    displayed Standard rate: this rate is one an imported document needs, not
+    a new default for the install.
+
+    Args:
+        win (WindowSpecification): The main window.
+        percentage (float): The extracted VAT percentage.
+
+    Returns:
+        Any: The unsaved editor.
+
+    Raises:
+        LookupError: If the view has no create button.
+        ValueError: If a field does not hold what we entered.
+    """
+    name = vat_name(percentage)
+    view = open_list_view(win, VATS_VIEW)
+    buttons = [c for c in view.descendants(control_type="Button") if c.element_info.name == NEW_VAT_BUTTON]
+    if not buttons:
+        raise LookupError(f"No {NEW_VAT_BUTTON!r} button in the {VATS_VIEW!r} view.")
+
+    with tracing.step(f"create the {name!r} rate"):
+        tracing.point_at(buttons[0])
+        buttons[0].iface_invoke.Invoke()
+        editor = wait_for_editor(win, NEW_VAT_TAB_RE, "New TAX Rate")
+
+        _set_text(editor, "Name", name)
+        _set_text(editor, "Description", name)
+        _set_text(editor, VAT_VALUE_LABEL, f"{percentage:g}%")
+
+    code = _field(editor, VAT_CODE_LABEL, control_type="ComboBox").selected_text()
+    if code != STANDARD_VAT_CODE:
+        raise ValueError(f"A new rate is coded {code!r}, expected {STANDARD_VAT_CODE!r}.")
+    shown = percentage(_field(editor, VAT_VALUE_LABEL).get_value())
+    if shown != percentage:
+        raise ValueError(f"Value reads {shown!r} after entering {percentage}%.")
+    tracing.point_at(editor, colour=tracing.CONFIRM)
+    return editor
+
+
+def create_product(
+    win: WindowSpecification,
+    sku: str,
+    description: str,
+    price: float,
+    vat: str,
+) -> Any:
+    """Fill in a new product for an item line (steps 3.7-3.10).
+
+    Opened from the toolbar's product button rather than the New panel's
+    "New product" link: they run the same command, but the toolbar button
+    answers Invoke while the link is a bare label whose click landed
+    elsewhere when the window was part off-screen.
+
+    The VAT rate has to exist before this runs -- the editor's VAT list is
+    filled when it opens, so a rate created afterwards would not be offered.
+
+    Leaves the editor unsaved for the caller to save. Category, GTIN,
+    supplier code, allowance, the picture and the user-defined fields are
+    left exactly as the editor proposes them.
+
+    Args:
+        win (WindowSpecification): The main window.
+        sku (str): The extracted item number.
+        description (str): The extracted item description, used for both the
+            product's name and its description.
+        price (float): The gross price, from `models.gross_price`.
+        vat (str): The name of the VAT rate to select, e.g. "VAT 19%".
+
+    Returns:
+        Any: The unsaved editor.
+
+    Raises:
+        LookupError: If the toolbar has no product button.
+        ValueError: If a field does not hold what we entered.
+    """
+    buttons = [c for c in win.descendants(control_type="Button") if c.element_info.name == NEW_PRODUCT_BUTTON]
+    if not buttons:
+        raise LookupError(f"No {NEW_PRODUCT_BUTTON!r} button in the toolbar.")
+
+    with tracing.step(f"create the product {sku!r}"):
+        tracing.point_at(buttons[0])
+        buttons[0].iface_invoke.Invoke()
+        editor = wait_for_editor(win, NEW_PRODUCT_TAB_RE, "New product")
+
+        # 3.8: the item number, and the description under both its names.
+        _set_text(editor, "Item Number", sku)
+        _set_text(editor, "Name", description)
+        _set_text(editor, "Description", description)
+
+        # 3.9-3.10: the master price, nothing for cost or stock, and the rate.
+        _set_text(editor, GROSS_PRICE_LABEL, f"{price:.2f}")
+        _set_text(editor, COST_PRICE_LABEL, ZERO_AMOUNT)
+        _set_text(editor, STOCK_LABEL, ZERO_AMOUNT)
+        _set_combo(editor, "VAT", vat)
+
+    shown = money(_field(editor, GROSS_PRICE_LABEL).get_value())
+    if shown != round(price, 2):
+        raise ValueError(f"{GROSS_PRICE_LABEL} reads {shown!r} after entering {price:.2f}.")
+    tracing.point_at(editor, colour=tracing.CONFIRM)
+    return editor
+
+
+def money(text: str) -> float | None:
+    """Read an amount out of a displayed value like "$297.50".
+
+    Args:
+        text (str): What the field shows.
+
+    Returns:
+        float | None: The amount, or None if there is none.
+    """
+    match = _NUMBER_RE.search(text.replace(",", ""))
+    return float(match.group()) if match else None
+
+
+def items_table(editor: Any) -> tuple[Any, Any]:
+    """The order's item table: the pane to read, and the canvas to click.
+
+    The table is two nested windows: an outer one whose pixels are the table
+    as drawn, and an inner canvas that handles the mouse. Clicks posted to the
+    outer one are ignored, which is why both are returned.
+
+    Args:
+        editor (Any): The order editor.
+
+    Returns:
+        tuple[Any, Any]: The pane to capture, and the canvas to click.
+
+    Raises:
+        LookupError: If the item table is not where it should be.
+    """
+    labels = {
+        c.element_info.name: c.rectangle()
+        for c in editor.descendants(control_type="Text")
+        if c.element_info.name in (ITEMS_LABEL, REMARKS_LABEL)
+    }
+    if ITEMS_LABEL not in labels:
+        raise LookupError(f"No {ITEMS_LABEL!r} label in the order editor.")
+    top = labels[ITEMS_LABEL].top
+    bottom = labels[REMARKS_LABEL].top if REMARKS_LABEL in labels else editor.rectangle().bottom
+
+    panes = [
+        c
+        for c in editor.descendants(control_type="Pane")
+        if getattr(c.element_info, "handle", None)
+        and c.rectangle().top >= top - LINE_TOLERANCE
+        and c.rectangle().bottom <= bottom
+    ]
+    if not panes:
+        raise LookupError("No item table between the Items label and the Remarks box.")
+    outer = max(panes, key=lambda c: c.rectangle().width() * c.rectangle().height())
+    inside = [
+        c
+        for c in panes
+        if c is not outer
+        and outer.rectangle().left <= c.rectangle().left
+        and c.rectangle().right <= outer.rectangle().right
+        and c.rectangle().top >= outer.rectangle().top
+    ]
+    return outer, (max(inside, key=lambda c: c.rectangle().width() * c.rectangle().height()) if inside else outer)
+
+
+def scroll_items(editor: Any, to_end: bool = False) -> None:
+    """Scroll the item table sideways so the wanted columns are on screen.
+
+    The table is wider than its pane, and a column that is scrolled out of
+    view can be neither read nor clicked.
+
+    Args:
+        editor (Any): The order editor.
+        to_end (bool): Scroll to the right-hand end instead of the left.
+    """
+    outer, canvas = items_table(editor)
+    # Only one of the table's nested windows carries the scroll pattern, and
+    # which one is not fixed -- a silently skipped scroll leaves the leftmost
+    # columns (Qty., Item No.) off screen, where they can be neither read nor
+    # clicked.
+    for pane in (canvas, outer):
+        try:
+            pane.iface_scroll.SetScrollPercent(100.0 if to_end else 0.0, -1.0)
+        except Exception:
+            continue
+        time.sleep(RESULTS_POLL_SECONDS)
+        return
+    # Neither pane scrolls, which means there is nothing to scroll: a
+    # maximized window shows the whole table at once.
+
+
+def read_items(editor: Any, to_end: bool = False) -> tuple[list[table.Row], dict[str, float], Any]:
+    """Read the order's item lines.
+
+    Args:
+        editor (Any): The order editor.
+        to_end (bool): Read the right-hand columns instead of the left-hand
+            ones; the table is too wide to show both at once.
+
+    Returns:
+        tuple[list[table.Row], dict[str, float], Any]: The lines, where each
+            column's header sits, and the capture they were read from.
+    """
+    scroll_items(editor, to_end)
+    outer, _ = items_table(editor)
+    picture = _grab(outer)
+    return table.read(picture), table.header_positions(picture), picture
+
+
+def set_item_cell(editor: Any, line: table.Row, column: str, value: str) -> None:
+    """Type a value into one cell of an item line (steps 3.13, 3.15).
+
+    A drawn table has no cell to address, so the cell is opened the way a
+    person opens it -- a double-click at the column's x and the line's y --
+    which puts a real text box over it. That box is then typed into and
+    committed with Return, exactly as if it had been filled by hand.
+
+    Args:
+        editor (Any): The order editor.
+        line (table.Row): The line to edit, from `read_items`.
+        column (str): The column's header, e.g. "Qty".
+        value (str): What to put in the cell.
+
+    Raises:
+        LookupError: If the column is not on screen.
+        TimeoutError: If no cell editor opens.
+        ValueError: If the cell does not end up holding `value`.
+    """
+    outer, canvas = items_table(editor)
+    # The table is wider than its pane: a column may be off to the right, so
+    # look at both ends before giving up on it. Column names come from reading
+    # the header, so they are matched the same forgiving way as list columns
+    # ("U.Price" comes back as "U.Prig" often enough).
+    columns = {}
+    for to_end in (False, True):
+        _, found, _ = read_items(editor, to_end=to_end)
+        columns = found
+        position = _column_x(found, column)
+        if position is not None:
+            break
+    else:
+        position = None
+    if position is None:
+        raise LookupError(f"No {column!r} column in the item table; it shows {sorted(columns)}.")
+
+    outer_rect, canvas_rect = outer.rectangle(), canvas.rectangle()
+    left, top, _, _ = win32gui.GetWindowRect(canvas.element_info.handle)
+    x = int(position + outer_rect.left - left)
+    y = int(line.y + outer_rect.top - top)
+    position = win32api.MAKELONG(x, y)
+
+    def open_and_write() -> None:
+        """Open the cell and put the value in it, from scratch."""
+        handle = canvas.element_info.handle
+        for message, flags in (
+            (win32con.WM_LBUTTONDOWN, win32con.MK_LBUTTON),
+            (win32con.WM_LBUTTONUP, 0),
+            (win32con.WM_LBUTTONDBLCLK, win32con.MK_LBUTTON),
+            (win32con.WM_LBUTTONUP, 0),
+        ):
+            win32gui.PostMessage(handle, message, flags, position)
+
+        box = _wait_for_cell_editor(editor, canvas_rect)
+        # Written, not typed. The cell's editor is created for the click and
+        # ignores posted characters -- they land as raw text ("111000") or not
+        # at all -- while a written value is picked up and recalculated. This
+        # is the opposite of the debtor's boxes, which ignore a written value.
+        box.iface_value.SetValue(value)
+        win32gui.PostMessage(box.element_info.handle, win32con.WM_KEYDOWN, win32con.VK_RETURN, 0)
+        win32gui.PostMessage(box.element_info.handle, win32con.WM_KEYUP, win32con.VK_RETURN, 0)
+        time.sleep(RESULTS_POLL_SECONDS)
+
+    # The editor belongs to the click that made it: once it goes, so does the
+    # handle we were writing through. Retrying the whole gesture -- click,
+    # find, write -- outlasts a cell that closed under us mid-redraw.
+    with tracing.step(f"set {column} to {value}"):
+        _retry(open_and_write)
+
+
+def _column_x(columns: dict[str, float], name: str) -> float | None:
+    """Find a column's x by name, ignoring case and punctuation.
+
+    Args:
+        columns (dict[str, float]): Header positions, as read from the table.
+        name (str): The column wanted.
+
+    Returns:
+        float | None: Its x, or None when the table does not show it.
+    """
+    wanted = normalize(name)
+    for header, x in columns.items():
+        if normalize(header) == wanted:
+            return x
+    return None
+
+
+def _wait_for_cell_editor(editor: Any, area: Any, timeout: int = DIALOG_TIMEOUT) -> Any:
+    """Wait for the text box a cell opens when it is double-clicked.
+
+    Args:
+        editor (Any): The order editor.
+        area (Any): The table's rectangle; the box appears inside it.
+        timeout (int): Seconds to wait.
+
+    Returns:
+        Any: The cell's text box.
+
+    Raises:
+        TimeoutError: If no box appears.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        boxes = [
+            c
+            for c in editor.descendants(control_type="Edit")
+            if area.top <= c.rectangle().top and c.rectangle().bottom <= area.bottom
+            and area.left <= c.rectangle().left and c.rectangle().right <= area.right
+        ]
+        if boxes:
+            return boxes[0]
+        if time.monotonic() >= deadline:
+            raise TimeoutError("No cell editor opened for the item line.")
+        time.sleep(RESULTS_POLL_SECONDS)
+
+
+def maximize(win: WindowSpecification) -> None:
+    """Make the window as large as the screen allows.
+
+    The order's item table is wider than a windowed Fakturama can show: its
+    Price column stays clipped however far the table is scrolled, and a value
+    that cannot be seen cannot be checked. Maximizing is the difference
+    between reading a line's price and guessing it.
+
+    Args:
+        win (WindowSpecification): The main window.
+    """
+    handle = win.element_info.handle
+    placement = win32gui.GetWindowPlacement(handle)
+    if placement[1] != win32con.SW_SHOWMAXIMIZED:
+        win32gui.ShowWindow(handle, win32con.SW_MAXIMIZE)
+        time.sleep(WINDOW_SETTLE_SECONDS)
+
+
+def find_item_line(editor: Any, sku: str) -> table.Row | None:
+    """The order line carrying `sku`, read from the item table.
+
+    Args:
+        editor (Any): The order editor.
+        sku (str): The item number to look for.
+
+    Returns:
+        table.Row | None: The line, or None if the table does not show it.
+    """
+    lines, _, _ = read_items(editor)
+    for line in lines:
+        if _cell_matches(line.get(ITEM_NUMBER_COLUMN), sku):
+            return line
+    return None
+
+
+def item_line(editor: Any, sku: str) -> table.Row | None:
+    """A line's values, with every column on screen at once.
+
+    Args:
+        editor (Any): The order editor.
+        sku (str): The item number of the line wanted.
+
+    Returns:
+        table.Row | None: The line, or None if it is not there.
+    """
+    lines, _, _ = read_items(editor, to_end=True)
+    for line in lines:
+        if _cell_matches(line.get(ITEM_NUMBER_COLUMN), sku) or _cell_matches(line.get(NAME_COLUMN), sku):
+            return line
+    return None
+
+
+def dismiss_dialog(dialog: Any, button: str) -> None:
     """Close a modal with one of its buttons, e.g. "OK" or "Cancel".
 
     Args:
@@ -1593,7 +2182,7 @@ def _find_dialog(process_id: int, title: str) -> int | None:
     return found[0] if found else None
 
 
-def wait_for_dialog(win: WindowSpecification, title: str, timeout: int = DIALOG_TIMEOUT) -> WindowSpecification:
+def wait_for_dialog(win: WindowSpecification, title: str, timeout: int = DIALOG_TIMEOUT) -> Any:
     """Wait for a modal dialog of the given title and return it.
 
     Args:
@@ -1602,7 +2191,9 @@ def wait_for_dialog(win: WindowSpecification, title: str, timeout: int = DIALOG_
         timeout (int): Seconds to wait.
 
     Returns:
-        WindowSpecification: The dialog.
+        Any: The dialog. It is a lazy specification, so it re-finds itself on
+            every use -- which is what keeps it valid across the redraws a
+            dialog goes through, at the cost of lookups that need retrying.
 
     Raises:
         TimeoutError: If it does not open in time.
@@ -1618,12 +2209,66 @@ def wait_for_dialog(win: WindowSpecification, title: str, timeout: int = DIALOG_
         time.sleep(0.25)
 
 
-def open_address_selector(editor: Any, win: WindowSpecification) -> WindowSpecification:
-    """Open Select the address from the order's Addresses row (step 2.1).
+def open_picker(
+    editor: Any, win: WindowSpecification, label: str, title: str, icons: int
+) -> Any:
+    """Open a picker dialog from the icons beside a section of the editor.
 
-    Clicks the upper icon, which picks an existing contact. The lower green +
-    beside it starts a brand new debtor and must not be touched here, so we
-    locate the pair and take the topmost rather than matching on an icon.
+    Both pickers work the same way: a little column of icons sits beside the
+    section -- Addresses, Items -- and the topmost one chooses something that
+    already exists, while the green + below it starts a new record. We take
+    the topmost by position rather than by recognising an icon, and insist on
+    finding exactly as many as that section is known to have, so a changed
+    toolbar fails a lookup instead of quietly clicking "new".
+
+    Args:
+        editor (Any): The order editor.
+        label (str): The section's label, e.g. "Items".
+        win (WindowSpecification): The main window, to find the dialog.
+        title (str): The dialog's caption.
+        icons (int): How many icons that section has.
+
+    Returns:
+        WindowSpecification: The open dialog.
+
+    Raises:
+        LookupError: If the section, or its expected icons, are not there.
+        TimeoutError: If the dialog does not open.
+    """
+    labels = [c for c in editor.descendants(control_type="Text") if c.element_info.name == label]
+    if not labels:
+        raise LookupError(f"No {label!r} label in the order editor.")
+
+    def buttons() -> list[Any]:
+        return sorted(labels[0].parent().children(control_type="Image"), key=lambda c: c.rectangle().top)
+
+    found = buttons()
+    if len(found) != icons:
+        raise LookupError(
+            f"Expected {icons} icons beside {label}, found {len(found)}; "
+            "refusing to guess which one picks an existing record."
+        )
+
+    with tracing.step(f"open {title!r} from the {label} row"):
+        tracing.point_at(found[0])
+        # An editor built moments ago can take the click before its icon is
+        # listening, and then nothing happens at all -- so the click is
+        # repeated, against a freshly located icon, until the dialog shows up.
+        for attempt in range(DIALOG_ATTEMPTS):
+            _post_click(found[0])
+            try:
+                dialog = wait_for_dialog(win, title, timeout=DIALOG_RETRY_SECONDS)
+                break
+            except TimeoutError:
+                if attempt == DIALOG_ATTEMPTS - 1:
+                    raise
+                found = buttons()
+    tracing.point_at(dialog, colour=tracing.CONFIRM)
+    return dialog
+
+
+def open_address_selector(editor: Any, win: WindowSpecification) -> Any:
+    """Open Select the address from the order's Addresses row (step 2.1).
 
     Args:
         editor (Any): The editor pane from `open_new_order`.
@@ -1631,40 +2276,93 @@ def open_address_selector(editor: Any, win: WindowSpecification) -> WindowSpecif
 
     Returns:
         WindowSpecification: The open dialog.
+    """
+    return open_picker(editor, win, ADDRESSES_LABEL, ADDRESS_DIALOG_TITLE, ADDRESS_ICON_COUNT)
+
+
+def open_product_selector(editor: Any, win: WindowSpecification) -> Any:
+    """Open Select a product from the order's Items table (step 3.2).
+
+    Args:
+        editor (Any): The order editor.
+        win (WindowSpecification): The main window, to find the dialog.
+
+    Returns:
+        WindowSpecification: The open dialog.
+    """
+    return open_picker(editor, win, ITEMS_LABEL, PRODUCT_DIALOG_TITLE, ITEM_ICON_COUNT)
+
+
+def select_product(editor: Any, win: WindowSpecification, sku: str) -> bool:
+    """Give the order's next line a product, by item number (steps 3.2-3.3).
+
+    The product picker does its own selecting: narrow its search to a single
+    product and it adds that product to the order and closes itself, with no
+    row to click and no OK to press. So the dialog closing is the success
+    signal, and a dialog still standing means the search did not identify one
+    product -- either none, or several to choose between.
+
+    (The address picker, which looks identical, does not behave this way: it
+    waits to be told. The difference is why this cannot reuse `search_list`,
+    which insists on reading its search box back afterwards.)
+
+    Args:
+        editor (Any): The order editor.
+        win (WindowSpecification): The main window.
+        sku (str): The extracted item number.
+
+    Returns:
+        bool: True if the product was added to the order; False if no product
+            carries that item number and it has to be created first.
 
     Raises:
-        LookupError: If the Addresses row does not hold exactly the two icons
-            we expect -- safer than guessing which one creates a debtor.
+        ManualReviewRequired: If the item number matches several products.
     """
-    labels = [c for c in editor.descendants(control_type="Text") if c.element_info.name == "Addresses"]
-    if not labels:
-        raise LookupError("No 'Addresses' label in the order editor.")
-    icons = sorted(labels[0].parent().children(control_type="Image"), key=lambda c: c.rectangle().top)
-    if len(icons) != ADDRESS_ICON_COUNT:
-        raise LookupError(
-            f"Expected {ADDRESS_ICON_COUNT} icons beside Addresses, found {len(icons)}; "
-            "refusing to guess which one picks an existing contact."
-        )
+    dialog = open_product_selector(editor, win)
+    handle = dialog.element_info.handle
 
-    with tracing.step(f"open {ADDRESS_DIALOG_TITLE!r} from the Addresses row"):
-        tracing.point_at(icons[0])
-        # An editor built moments ago can take the click before its icon is
-        # listening, and then nothing happens at all -- so the click is
-        # repeated, against a freshly located icon, until the dialog shows up.
-        for attempt in range(DIALOG_ATTEMPTS):
-            _post_click(icons[0])
-            try:
-                dialog = wait_for_dialog(win, ADDRESS_DIALOG_TITLE, timeout=DIALOG_RETRY_SECONDS)
-                break
-            except TimeoutError:
-                if attempt == DIALOG_ATTEMPTS - 1:
-                    raise
-                icons = sorted(
-                    labels[0].parent().children(control_type="Image"),
-                    key=lambda c: c.rectangle().top,
-                )
-    tracing.point_at(dialog, colour=tracing.CONFIRM)
-    return dialog
+    with tracing.step(f"search products for {sku!r}"):
+        # The whole term at once, never character by character. This picker
+        # filters on every keystroke and accepts the moment one row is left,
+        # so typing "CHR-ERG-01" walks through prefixes that match something
+        # else entirely -- "CH" alone picked "Sicherung 1A" and put it on the
+        # order. Writing the value skips those intermediate states.
+        _retry(lambda: _search_box(dialog).iface_value.SetValue(sku))
+        settled = _wait_for_pick(handle, dialog)
+    if settled is None:
+        return True
+
+    rows = table.read(settled)
+    exact = [row for row in rows if _cell_matches(row.get(SKU_COLUMN), sku)]
+    if len(exact) > 1:
+        dismiss_dialog(dialog, "Cancel")
+        raise ManualReviewRequired(f"{len(exact)} products carry the item number {sku!r}", exact)
+    if exact:
+        choose_row(dialog, exact[0])
+        return True
+
+    dismiss_dialog(dialog, "Cancel")
+    return False
+
+
+def _wait_for_pick(handle: int, dialog: Any, timeout: int = RESULTS_TIMEOUT) -> Image.Image | None:
+    """Wait for the picker to either choose for us or settle on a list.
+
+    Args:
+        handle (int): The dialog's window.
+        dialog (Any): The dialog.
+        timeout (int): Seconds to wait for the list to settle.
+
+    Returns:
+        Image.Image | None: The settled list, or None if the dialog picked a
+            product and closed itself.
+    """
+    deadline = time.monotonic() + PICK_SETTLE_SECONDS
+    while time.monotonic() < deadline:
+        if not (win32gui.IsWindow(handle) and win32gui.IsWindowVisible(handle)):
+            return None
+        time.sleep(RESULTS_POLL_SECONDS)
+    return wait_for_results(dialog, timeout)
 
 
 def _grab(ctrl: Any) -> Image.Image:
@@ -1708,7 +2406,43 @@ def _grab(ctrl: Any) -> Image.Image:
         win32gui.ReleaseDC(handle, window_dc)
 
 
+def _retry(action: Any, attempts: int = UIA_ATTEMPTS) -> Any:
+    """Repeat a UI Automation call that failed for a passing reason.
+
+    Resolving a control while the application is mid-redraw fails with a COM
+    error ("An event was unable to invoke any of the subscribers") that means
+    nothing except "not now" -- a moment later the same call succeeds. Only
+    the last failure is allowed to escape.
+
+    Args:
+        action (Any): A callable taking no arguments.
+        attempts (int): How many times to try it.
+
+    Returns:
+        Any: Whatever `action` returned.
+    """
+    for attempt in range(attempts):
+        try:
+            return action()
+        except Exception:
+            if attempt == attempts - 1:
+                raise
+            time.sleep(UIA_RETRY_SECONDS)
+
+
 def _search_box(container: Any) -> Any:
+    """Return a dialog's or list view's search box, retrying transient failures.
+
+    Args:
+        container (Any): A dialog or list view holding a searchable list.
+
+    Returns:
+        Any: The search Edit.
+    """
+    return _retry(lambda: _locate_search_box(container))
+
+
+def _locate_search_box(container: Any) -> Any:
     """Return a dialog's or list view's search box.
 
     Args:
@@ -1730,6 +2464,18 @@ def _search_box(container: Any) -> Any:
 
 
 def _list_pane(container: Any) -> Any:
+    """Return the pane holding the result rows, retrying transient failures.
+
+    Args:
+        container (Any): A dialog or list view holding a searchable list.
+
+    Returns:
+        Any: The results pane.
+    """
+    return _retry(lambda: _locate_list_pane(container))
+
+
+def _locate_list_pane(container: Any) -> Any:
     """Return the pane holding the result rows.
 
     The list is a drawn table (a canvas, not a tree of controls), so it has no
@@ -1812,8 +2558,8 @@ def search_list(container: Any, term: str) -> list[table.Row]:
         # it finishes building, so the box is re-found and rewritten until it
         # keeps what we put in it.
         for attempt in range(SEARCH_ATTEMPTS):
-            _search_box(container).iface_value.SetValue(term)
-            shown = _search_box(container).get_value()
+            _retry(lambda: _search_box(container).iface_value.SetValue(term))
+            shown = _retry(lambda: _search_box(container).get_value())
             if shown == term:
                 break
             if attempt == SEARCH_ATTEMPTS - 1:
@@ -1879,7 +2625,7 @@ if __name__ == "__main__":
         if existing_debtor:
             # 2.4: it is already there, so use it, then check the order really
             # got the document's address before going on to the products.
-            choose_address(dialog, existing_debtor)
+            choose_row(dialog, existing_debtor)
             order_editor = activate_editor(window, NEW_ORDER_TAB_RE, "New Order")
             filled = confirm_order_addresses(
                 order_editor,
@@ -1974,7 +2720,7 @@ if __name__ == "__main__":
         if len(found) != 1:
             dismiss_dialog(dialog, "Cancel")
             raise ManualReviewRequired(f"{len(found)} debtors match {DEMO_COMPANY!r}", found)
-        choose_address(dialog, found[0])
+        choose_row(dialog, found[0])
 
         # 2.13: the order should now carry the debtor's address.
         order_editor = activate_editor(window, NEW_ORDER_TAB_RE, "New Order")

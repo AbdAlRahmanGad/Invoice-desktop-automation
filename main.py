@@ -19,7 +19,7 @@ import argparse
 
 import fakturama
 import tracing
-from models import PostalAddress, SalesOrder, parse_postal_address, same_address
+from models import PostalAddress, SalesOrder, gross_price, line_total, parse_postal_address, same_address
 from sales_order import extract_sales_order
 
 
@@ -207,7 +207,7 @@ def select_debtor(win: object, order_editor: object, order: SalesOrder, billing:
             )
 
     print(f"debtor: {debtor.cells}", flush=True)
-    fakturama.choose_address(dialog, debtor)
+    fakturama.choose_row(dialog, debtor)
 
     # 2.4 / 2.13: the order should now carry the document's address.
     order_editor = fakturama.activate_editor(win, fakturama.NEW_ORDER_TAB_RE, "New Order")
@@ -218,6 +218,157 @@ def select_debtor(win: object, order_editor: object, order: SalesOrder, billing:
     for role, text in filled.items():
         print(f"{role}: {text!r}", flush=True)
     return order_editor
+
+
+def select_products(win: object, order_editor: object, order: SalesOrder) -> object:
+    """Give every item line its product, in source order (steps 3.1-3.3).
+
+    Args:
+        win (object): The main window.
+        order_editor (object): The order editor.
+        order (SalesOrder): The extracted order.
+
+    Returns:
+        object: The order editor, back in front.
+
+    Raises:
+        fakturama.ManualReviewRequired: If a line has no SKU to search for, if
+            the product list is ambiguous, or if the product does not exist --
+            creating one is steps 3.4-3.12, which are not built yet.
+    """
+    for position, item in enumerate(order.items, start=1):
+        if not item.sku:
+            raise fakturama.ManualReviewRequired(f"Item {position} has no SKU to search for", [])
+
+        if not fakturama.select_product(order_editor, win, item.sku):
+            # 3.4-3.11: no such product, so make one -- the order stays open.
+            create_product(win, item)
+
+            # 3.12: back to the order and pick the product we just saved.
+            order_editor = fakturama.activate_editor(win, fakturama.NEW_ORDER_TAB_RE, "New Order")
+            if not fakturama.select_product(order_editor, win, item.sku):
+                raise fakturama.ManualReviewRequired(
+                    f"Product {item.sku!r} was saved but the picker still does not offer it", []
+                )
+        # 3.13-3.16: quantity, discount, and the checks on what it comes to.
+        order_editor = fakturama.activate_editor(win, fakturama.NEW_ORDER_TAB_RE, "New Order")
+        complete_line(win, order_editor, item)
+        print(f"item {position}: {item.sku} added and completed", flush=True)
+    return order_editor
+
+
+def ensure_vat(win: object, percentage: float) -> str:
+    """Make sure the VAT rate an item needs exists (steps 3.4-3.6).
+
+    Args:
+        win (object): The main window.
+        percentage (float): The extracted VAT percentage.
+
+    Returns:
+        str: The rate's name, for selecting in the product editor.
+    """
+    name = fakturama.vat_name(percentage)
+    if fakturama.find_vat(win, percentage):
+        return name
+
+    fakturama.create_vat(win, percentage)
+    fakturama.save_editor(win, fakturama.NEW_VAT_TAB_RE, "New TAX Rate")
+    print(f"created the {name} rate", flush=True)
+    return name
+
+
+def create_product(win: object, item: object) -> None:
+    """Create the product an item line needs (steps 3.4-3.11).
+
+    Args:
+        win (object): The main window.
+        item (object): The extracted line item.
+
+    Raises:
+        fakturama.ManualReviewRequired: If the line gives no price or VAT to
+            work out the product's price from.
+    """
+    if item.unit_price is None or item.vat_pct is None:
+        raise fakturama.ManualReviewRequired(
+            f"Item {item.sku!r} has no unit price or VAT percentage to price a product with", []
+        )
+
+    # 3.4-3.7: the rate first, so the product editor offers it.
+    vat = ensure_vat(win, item.vat_pct)
+
+    fakturama.create_product(
+        win,
+        sku=item.sku,
+        description=item.description or item.sku,
+        price=gross_price(item.unit_price, item.vat_pct),
+        vat=vat,
+    )
+    # 3.11: save, once.
+    fakturama.save_editor(win, fakturama.NEW_PRODUCT_TAB_RE, "New product")
+    print(f"created product {item.sku}", flush=True)
+
+
+def complete_line(win: object, order_editor: object, item: object) -> None:
+    """Fill in and check the order line for `item` (steps 3.13-3.16).
+
+    Args:
+        win (object): The main window.
+        order_editor (object): The order editor.
+        item (object): The extracted line item.
+
+    Raises:
+        fakturama.ManualReviewRequired: If the line cannot be found, if what
+            the product brought with it disagrees with the document, or if the
+            line total does not come to what the document says it should.
+    """
+    line = fakturama.find_item_line(order_editor, item.sku)
+    if line is None:
+        raise fakturama.ManualReviewRequired(f"No order line for {item.sku!r} to complete", [])
+
+    # 3.13 and 3.15: the quantity and the discount this transaction was given.
+    if item.qty is not None:
+        fakturama.set_item_cell(order_editor, line, fakturama.QTY_COLUMN, f"{item.qty:g}")
+    if item.discount_pct:
+        fakturama.set_item_cell(order_editor, line, fakturama.LINE_DISCOUNT_COLUMN, f"{item.discount_pct:g}")
+
+    # 3.14 and 3.16: what the product brought with it, and what it comes to.
+    filled = fakturama.item_line(order_editor, item.sku)
+    if filled is None:
+        raise fakturama.ManualReviewRequired(f"The line for {item.sku!r} disappeared while filling it", [])
+    check_line(filled, item)
+
+
+def check_line(line: object, item: object) -> None:
+    """Check a filled-in line against the document (steps 3.14, 3.16).
+
+    Args:
+        line (object): The line as the order shows it.
+        item (object): The extracted line item.
+
+    Raises:
+        fakturama.ManualReviewRequired: On any disagreement.
+    """
+    complaints = []
+    unit = fakturama.money(line.get(fakturama.UNIT_PRICE_COLUMN))
+    if item.unit_price is not None and unit != round(item.unit_price, 2):
+        complaints.append(f"unit price reads {line.get(fakturama.UNIT_PRICE_COLUMN)!r}, document says {item.unit_price}")
+
+    vat = fakturama.percentage(line.get(fakturama.LINE_VAT_COLUMN))
+    if item.vat_pct is not None and vat != item.vat_pct:
+        complaints.append(f"VAT reads {line.get(fakturama.LINE_VAT_COLUMN)!r}, document says {item.vat_pct}%")
+
+    # The discount is shown as a negative adjustment, so it is compared by size.
+    discount = fakturama.percentage(line.get(fakturama.LINE_DISCOUNT_COLUMN))
+    if item.discount_pct is not None and discount is not None and abs(discount) != item.discount_pct:
+        complaints.append(f"discount reads {line.get(fakturama.LINE_DISCOUNT_COLUMN)!r}, document says {item.discount_pct}%")
+
+    price = fakturama.money(line.get(fakturama.LINE_PRICE_COLUMN))
+    expected = line_total(item)
+    if expected is not None and price != expected:
+        complaints.append(f"line price reads {line.get(fakturama.LINE_PRICE_COLUMN)!r}, expected {expected:.2f}")
+
+    if complaints:
+        raise fakturama.ManualReviewRequired(f"The line for {item.sku!r} does not match: " + "; ".join(complaints), [])
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -260,12 +411,15 @@ def main(path: str) -> None:
     print(order.model_dump_json(indent=2))
 
     window = fakturama.connect()
+    # The item table's right-hand columns are only readable at full width.
+    fakturama.maximize(window)
     order_editor = fakturama.open_new_order(window)
     enter_header(order_editor, order)
 
     billing = parse_postal_address(order.billing_address, order.company)
-    select_debtor(window, order_editor, order, billing)
-    print("header and customer entered; the New Order tab is left open and unsaved.", flush=True)
+    order_editor = select_debtor(window, order_editor, order, billing)
+    order_editor = select_products(window, order_editor, order)
+    print("header, customer and products entered; the New Order tab is left open and unsaved.", flush=True)
 
 
 if __name__ == "__main__":

@@ -93,6 +93,23 @@ def same_address(first: str | None, second: str | None) -> bool:
     return _ADDRESS_NOISE_RE.sub("", first).casefold() == _ADDRESS_NOISE_RE.sub("", second).casefold()
 
 
+def gross_price(unit_price: float, vat_percentage: float) -> float:
+    """The gross price a product master record carries (step 3.9).
+
+    The line's own discount is deliberately not applied: it is a term of this
+    transaction, while the product's price is what the product costs in
+    general. Rounded to the cent, because that is what the field holds.
+
+    Args:
+        unit_price (float): The document's net unit price.
+        vat_percentage (float): The document's VAT percentage for that line.
+
+    Returns:
+        float: Net price plus VAT, to two decimal places.
+    """
+    return round(unit_price * (1 + vat_percentage / 100), 2)
+
+
 class LineItem(BaseModel):
     sku: str | None = None
     description: str | None = None
@@ -107,6 +124,21 @@ class LineItem(BaseModel):
     @classmethod
     def _parse_number(cls, v: Any) -> float | None:
         return _to_number(v)
+
+
+def line_total(item: "LineItem") -> float | None:
+    """What an item line should come to (step 3.16).
+
+    Args:
+        item (LineItem): The extracted line.
+
+    Returns:
+        float | None: Quantity x unit price less the line's discount, to the
+            cent, or None when the document did not give enough to work it out.
+    """
+    if item.qty is None or item.unit_price is None:
+        return None
+    return round(item.qty * item.unit_price * (1 - (item.discount_pct or 0) / 100), 2)
 
 
 class SalesOrder(BaseModel):
