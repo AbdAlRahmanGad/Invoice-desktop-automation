@@ -371,6 +371,49 @@ def check_line(line: object, item: object) -> None:
         raise fakturama.ManualReviewRequired(f"The line for {item.sku!r} does not match: " + "; ".join(complaints), [])
 
 
+def finish_order(win: object, order_editor: object, order: SalesOrder) -> object:
+    """Check the order over, save it, and raise its invoice (steps 4.1-4.7).
+
+    Args:
+        win (object): The main window.
+        order_editor (object): The order editor.
+        order (SalesOrder): The extracted order.
+
+    Returns:
+        object: The linked invoice editor, left open for the next stage.
+
+    Raises:
+        fakturama.ManualReviewRequired: If the order does not add up to what
+            the document says, or does not read back once saved.
+    """
+    # 4.2-4.3: no charges of the order's own, and totals that agree.
+    fakturama.confirm_order_charges(order_editor)
+    totals = fakturama.confirm_order_totals(
+        order_editor, net=order.net_total, vat=order.vat_total, gross=order.gross_total
+    )
+    print(f"totals: {totals}", flush=True)
+
+    # 4.4: save, once.
+    number = fakturama.save_order(win, order_editor)
+    print(f"saved as {number}", flush=True)
+
+    # 4.5: and read it back from Data > Documents.
+    row = fakturama.confirm_document_row(
+        win,
+        number,
+        reference=order.external_reference,
+        state=fakturama.OPEN_STATE,
+        total=f"{order.gross_total:.2f}" if order.gross_total is not None else None,
+    )
+    print(f"documents: {row.cells}", flush=True)
+
+    # 4.6-4.7: the invoice, raised from the order so the link is kept.
+    order_editor = fakturama.activate_editor(win, rf"^\*?{number}$", number)
+    invoice_editor = fakturama.create_follow_up(win, order_editor)
+    print(f"invoice editor: {invoice_editor.element_info.name}", flush=True)
+    return invoice_editor
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Read the command line.
 
@@ -419,7 +462,8 @@ def main(path: str) -> None:
     billing = parse_postal_address(order.billing_address, order.company)
     order_editor = select_debtor(window, order_editor, order, billing)
     order_editor = select_products(window, order_editor, order)
-    print("header, customer and products entered; the New Order tab is left open and unsaved.", flush=True)
+    finish_order(window, order_editor, order)
+    print("order saved and its invoice opened; nothing else is filed.", flush=True)
 
 
 if __name__ == "__main__":

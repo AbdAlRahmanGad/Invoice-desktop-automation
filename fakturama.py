@@ -174,6 +174,34 @@ PAYMENT_CODES = {
     "SEPA Direct Debit": "SEPA direct debit",
 }
 
+#: The order's totals, its own charges, and the number it is filed under
+#: (steps 4.2-4.4).
+ORDER_TOTAL_LABELS = {"net": "Total Net", "vat": "VAT", "gross": "Total"}
+ORDER_NUMBER_LABEL = "No."
+SHIPPING_LABEL = "Shipping"
+FREE_SHIPPING = "Free of shipping costs"
+
+#: Data > Documents, where a saved order is checked (step 4.5).
+DOCUMENTS_VIEW = "Documents"
+DOCUMENT_COLUMN = "Document"
+DOCUMENT_MATCH_COLUMNS = {
+    "date": "Date",
+    "reference": "Cust.Ref.",
+    "state": "State",
+    "total": "Total",
+}
+
+#: What Documents shows in State for an order that has been saved but not yet
+#: turned into anything.
+OPEN_STATE = "open"
+
+#: Raising the next document from the order itself (steps 4.6-4.7). The
+#: follow-up controls are tall image buttons, which is what tells them from
+#: the identically-named toolbar button that would start an unrelated invoice.
+FOLLOW_UP_INVOICE = "Invoice"
+FOLLOW_UP_MIN_HEIGHT = 40
+FOLLOW_UP_TAB_RE = r"^\*?New {kind}$"
+
 #: Columns of the item table used to find and check a line.
 ITEM_NUMBER_COLUMN = "Item No"
 NAME_COLUMN = "Name"
@@ -212,6 +240,10 @@ VAT_VALUE_LABEL = "Value"
 #: The e-invoice code a normal rate carries, which a new rate already has.
 VAT_CODE_LABEL = "VAT code (E-Invoice)"
 STANDARD_VAT_CODE = "S (Standard rate)"
+
+#: A value that is only a number, so it should be compared as one however the
+#: app decorates it ("678.30" against "$678.30").
+_AMOUNT_RE = re.compile(r"[-+]?\d[\d.,]*")
 
 #: A number in displayed text, for reading a percentage back.
 _NUMBER_RE = re.compile(r"[-+]?\d*\.?\d+")
@@ -2061,6 +2093,193 @@ def item_line(editor: Any, sku: str) -> table.Row | None:
     return None
 
 
+def _shown_date(iso_date: str) -> str:
+    """An ISO date as Fakturama prints it in a list ("2026-07-14" -> "Jul 14, 2026").
+
+    Args:
+        iso_date (str): The date in ISO form.
+
+    Returns:
+        str: The same date, formatted the way the app displays it.
+    """
+    return date.fromisoformat(iso_date).strftime(DATE_DISPLAY_FORMAT)
+
+
+def order_totals(editor: Any) -> dict[str, float | None]:
+    """What the order says it comes to (step 4.3).
+
+    Args:
+        editor (Any): The order editor.
+
+    Returns:
+        dict[str, float | None]: Net, VAT and gross, as the editor shows them.
+    """
+    return {
+        name: money(_field(editor, label).get_value())
+        for name, label in ORDER_TOTAL_LABELS.items()
+    }
+
+
+def confirm_order_totals(
+    editor: Any, net: float | None = None, vat: float | None = None, gross: float | None = None
+) -> dict[str, float | None]:
+    """Check the order's totals against the document's (step 4.3).
+
+    Totals are the one number on the page that depends on everything else, so
+    they are the check worth making before saving: if the lines, the VAT rate
+    and the discounts are all right, these agree, and if any of them is wrong,
+    these do not.
+
+    Args:
+        editor (Any): The order editor.
+        net (float | None): The document's net total, if it gives one.
+        vat (float | None): Its VAT total.
+        gross (float | None): Its gross total.
+
+    Returns:
+        dict[str, float | None]: The totals the order shows.
+
+    Raises:
+        ManualReviewRequired: If a total the document gives disagrees.
+    """
+    shown = order_totals(editor)
+    wanted = {"net": net, "vat": vat, "gross": gross}
+    complaints = [
+        f"{name} reads {shown[name]}, document says {value}"
+        for name, value in wanted.items()
+        if value is not None and shown[name] != round(value, 2)
+    ]
+    if complaints:
+        raise ManualReviewRequired("The order's totals do not match: " + "; ".join(complaints), [])
+    return shown
+
+
+def confirm_order_charges(editor: Any) -> None:
+    """Check the order carries no charges of its own (step 4.2).
+
+    The document prices its lines and nothing else, so an order-level discount
+    or a shipping charge here would be money the document never mentioned.
+    They are Fakturama's defaults, so this confirms rather than sets them.
+
+    Args:
+        editor (Any): The order editor.
+
+    Raises:
+        ManualReviewRequired: If either has been given a value.
+    """
+    discount = _field(editor, DISCOUNT_LABEL).get_value()
+    shipping = _field(editor, SHIPPING_LABEL, control_type="ComboBox").selected_text()
+    charge = money(_fields(editor, SHIPPING_LABEL)[-1].get_value()) if _fields(editor, SHIPPING_LABEL) else None
+    if percentage(discount) or shipping != FREE_SHIPPING or charge:
+        raise ManualReviewRequired(
+            f"The order carries charges the document does not: discount {discount!r}, "
+            f"shipping {shipping!r} at {charge!r}",
+            [],
+        )
+
+
+def save_order(win: WindowSpecification, editor: Any) -> str:
+    """Save the order once, and return the number it was filed under (step 4.4).
+
+    Args:
+        win (WindowSpecification): The main window.
+        editor (Any): The order editor.
+
+    Returns:
+        str: The order's No., which is also what its tab is renamed to.
+    """
+    number = _field(editor, ORDER_NUMBER_LABEL).get_value()
+    save_editor(win, NEW_ORDER_TAB_RE, "New Order")
+    return number
+
+
+def confirm_document_row(win: WindowSpecification, number: str, **expected: str | None) -> table.Row:
+    """Find the saved order in Data > Documents and check it (step 4.5).
+
+    Args:
+        win (WindowSpecification): The main window.
+        number (str): The order's number, as `save_order` returned it.
+        **expected (str | None): Columns to check, keyed as in
+            `DOCUMENT_MATCH_COLUMNS` -- date, reference, state, total.
+
+    Returns:
+        table.Row: The row the list shows for this order.
+
+    Raises:
+        ManualReviewRequired: If the order is not listed once, or a column
+            disagrees with what was entered.
+    """
+    view = open_list_view(win, DOCUMENTS_VIEW)
+    rows = [row for row in search_list(view, number) if _cell_matches(row.get(DOCUMENT_COLUMN), number)]
+    if len(rows) != 1:
+        raise ManualReviewRequired(f"{len(rows)} documents are numbered {number!r}", rows)
+
+    row = rows[0]
+    complaints = [
+        f"{DOCUMENT_MATCH_COLUMNS[field]} reads {row.get(DOCUMENT_MATCH_COLUMNS[field])!r}, expected {value!r}"
+        for field, value in expected.items()
+        if value and field in DOCUMENT_MATCH_COLUMNS
+        and not _column_agrees(row.get(DOCUMENT_MATCH_COLUMNS[field]), value)
+    ]
+    if complaints:
+        raise ManualReviewRequired(f"The saved order {number!r} does not read back: " + "; ".join(complaints), [row])
+    return row
+
+
+def _column_agrees(shown: str, expected: str) -> bool:
+    """Whether a listed cell says the same thing as `expected`.
+
+    Amounts are compared as numbers, because the list writes them with the
+    currency it is configured for ("$678.30") while the document gives a bare
+    figure. Everything else is compared as text, allowing for truncation.
+
+    Args:
+        shown (str): What the cell shows.
+        expected (str): What it should say.
+
+    Returns:
+        bool: True when they agree.
+    """
+    if _AMOUNT_RE.fullmatch(expected.strip()):
+        return money(shown) == money(expected)
+    return _cell_matches(shown, expected)
+
+
+def create_follow_up(win: WindowSpecification, editor: Any, kind: str = FOLLOW_UP_INVOICE) -> Any:
+    """Raise a follow-up document from the saved order (steps 4.6-4.7).
+
+    From the order's own "Create a follow-up document" area, not the toolbar:
+    the toolbar's Invoice button starts an unrelated invoice, while this one
+    carries the order's lines, its customer and the link back to it.
+
+    Args:
+        win (WindowSpecification): The main window.
+        editor (Any): The saved order's editor.
+        kind (str): Which follow-up to raise, e.g. "Invoice".
+
+    Returns:
+        Any: The new document's editor.
+
+    Raises:
+        LookupError: If the order editor offers no such follow-up.
+        TimeoutError: If no editor opens.
+    """
+    buttons = [
+        c
+        for c in editor.descendants(control_type="Button")
+        if c.element_info.name == kind and c.rectangle().height() > FOLLOW_UP_MIN_HEIGHT
+    ]
+    if not buttons:
+        raise LookupError(f"No {kind!r} follow-up on this order.")
+
+    with tracing.step(f"create the follow-up {kind}"):
+        tracing.point_at(buttons[0])
+        buttons[0].iface_invoke.Invoke()
+        follow_up = wait_for_editor(win, FOLLOW_UP_TAB_RE.format(kind=kind), f"New {kind}")
+    tracing.point_at(follow_up, colour=tracing.CONFIRM)
+    return follow_up
+
+
 def dismiss_dialog(dialog: Any, button: str) -> None:
     """Close a modal with one of its buttons, e.g. "OK" or "Cancel".
 
@@ -2588,6 +2807,9 @@ DEMO_EMAIL = "marta.klein@example.test"
 DEMO_PHONE = "+49 30 5550 1420"
 
 
+#: What the document's own totals come to, for the check in step 4.3.
+DEMO_TOTALS = {"net": 570.00, "vat": 108.30, "gross": 678.30}
+
 #: The document's item lines, as extraction reads them off invoice.pdf. The
 #: gross price and line total are what steps 3.9 and 3.16 work out from the
 #: rest; they are spelled out here so the smoke run can check the app's
@@ -2805,7 +3027,29 @@ if __name__ == "__main__":
                     f"Line {position} comes to {price!r}, the document says {item['line_total']:.2f}", []
                 )
 
-        print("order tabs still open:", _tab_count(window, NEW_ORDER_TAB_RE))
-        print("header, customer and products entered; the order is left open and unsaved.")
+        # --- 4.1-4.3: nothing of the order's own, and totals that agree ----
+        confirm_order_charges(order_editor)
+        print("totals:", confirm_order_totals(order_editor, **DEMO_TOTALS))
+
+        # --- 4.4-4.5: save it, then read it back from Data > Documents -----
+        number = save_order(window, order_editor)
+        print("saved as:", number)
+        print(
+            "documents:",
+            confirm_document_row(
+                window,
+                number,
+                date=_shown_date(DEMO_ORDER_DATE),
+                reference=DEMO_EXTERNAL_REFERENCE,
+                state=OPEN_STATE,
+                total=f"{DEMO_TOTALS['gross']:.2f}",
+            ).cells,
+        )
+
+        # --- 4.6-4.7: the invoice, raised from the order to keep the link --
+        order_editor = activate_editor(window, rf"^\*?{number}$", number)
+        invoice_editor = create_follow_up(window, order_editor)
+        print("invoice editor:", invoice_editor.element_info.name)
+        print("order saved and its invoice opened; nothing else is filed.")
     finally:
         tracing.stop()
