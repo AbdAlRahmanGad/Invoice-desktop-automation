@@ -35,7 +35,7 @@ pywinauto==0.6.9
 pywin32==312
 setuptools==84.0.0
 
-# --- Transitive, pinned for reproducibility (46) ---------------------
+# --- Transitive, pinned for reproducibility (48) ---------------------
 albucore==0.0.24
 albumentations==2.0.8
 annotated-types==0.8.0
@@ -74,6 +74,7 @@ requests==2.34.2
 scikit-image==0.26.0
 scipy==1.17.1
 shapely==2.1.2
+six==1.17.0
 simsimd==6.5.16
 soupsieve==2.9.2
 stringzilla==5.1.2
