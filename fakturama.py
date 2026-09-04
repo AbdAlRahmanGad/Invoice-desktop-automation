@@ -221,8 +221,10 @@ ITEM_NUMBER_COLUMN = "Item No"
 NAME_COLUMN = "Name"
 
 #: Seconds to let a line's own total catch up with a quantity or discount
-#: that was just typed into it.
+#: that was just typed into it, and how many times to enter them before
+#: giving up on the app taking them.
 LINE_SETTLE_TIMEOUT = 10
+LINE_ATTEMPTS = 3
 
 #: Seconds to let a resized window settle before reading it.
 WINDOW_SETTLE_SECONDS = 1.0
@@ -381,11 +383,73 @@ def connect() -> WindowSpecification:
     # one is open.
     win.wait("visible", timeout=EDITOR_TIMEOUT)
 
+    clear_leftover_pickers(win)
     wake(win)
     return win
 
 
-def wake(win: WindowSpecification) -> None:
+def clear_leftover_pickers(win: WindowSpecification) -> None:
+    """Cancel a picker left open by a run that stopped part way.
+
+    A modal disables the main window, and a disabled window publishes almost
+    nothing to the accessibility layer -- so the next run cannot find the
+    toolbar, cannot wake the window either, and fails with a puzzle instead of
+    a reason. Pickers are ours and hold nothing: Cancel is their do-nothing
+    button, so they are simply closed.
+
+    Any other dialog is left alone and reported: it may be the application
+    asking something that matters, and answering it is not ours to guess.
+
+    Args:
+        win (WindowSpecification): The main window.
+
+    Raises:
+        RuntimeError: If a dialog that is not a picker is open.
+    """
+    _, process_id = win32process.GetWindowThreadProcessId(win.element_info.handle)
+    for title in (ADDRESS_DIALOG_TITLE, PRODUCT_DIALOG_TITLE):
+        handle = _find_dialog(process_id, title)
+        if handle:
+            # Closed with WM_CLOSE rather than by its Cancel button: a dialog
+            # from an abandoned run publishes as little of itself as the
+            # disabled window behind it, so there is no button to find. For a
+            # picker this is the same as Cancel -- it holds nothing to lose.
+            print(f"closing a {title!r} dialog left open by an earlier run", flush=True)
+            win32gui.PostMessage(handle, win32con.WM_CLOSE, 0, 0)
+            deadline = time.monotonic() + DIALOG_TIMEOUT
+            while win32gui.IsWindow(handle) and win32gui.IsWindowVisible(handle):
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(f"A {title!r} dialog is open and will not close.")
+                time.sleep(0.1)
+
+    if not win32gui.IsWindowEnabled(win.element_info.handle):
+        raise RuntimeError(
+            f"A dialog is open in Fakturama ({_open_dialog_titles(process_id)}) and the main "
+            "window is disabled. Close it and run again."
+        )
+
+
+def _open_dialog_titles(process_id: int) -> list[str]:
+    """The captions of the process's visible dialogs, for an error message.
+
+    Args:
+        process_id (int): The Fakturama process.
+
+    Returns:
+        list[str]: What is open.
+    """
+    found: list[str] = []
+
+    def visit(handle: int, _: Any) -> None:
+        _, pid = win32process.GetWindowThreadProcessId(handle)
+        if pid == process_id and win32gui.IsWindowVisible(handle) and win32gui.GetClassName(handle) == DIALOG_CLASS:
+            found.append(win32gui.GetWindowText(handle))
+
+    win32gui.EnumWindows(visit, None)
+    return found
+
+
+def wake(win: WindowSpecification, force: bool = False) -> None:
     """Make sure the window has published its contents to the tree.
 
     Fakturama shows only its title bar and menu until something gives it the
@@ -399,9 +463,12 @@ def wake(win: WindowSpecification) -> None:
 
     Args:
         win (WindowSpecification): The main window.
+        force (bool): Focus it even though its tree looks populated. A partly
+            published tree has children and still lacks the control being
+            looked for, so a caller that cannot find one asks for this.
     """
     handle = win.element_info.handle
-    if win32gui.IsWindowEnabled(handle) and len(win.children()) <= THIN_TREE_CHILDREN:
+    if win32gui.IsWindowEnabled(handle) and (force or len(win.children()) <= THIN_TREE_CHILDREN):
         with tracing.step("wake the window's controls"):
             win.set_focus()
             time.sleep(WINDOW_SETTLE_SECONDS)
@@ -440,7 +507,9 @@ def open_new_order(win: WindowSpecification) -> Any:
     """
     with tracing.step(f"click {NEW_ORDER_BUTTON!r} in the toolbar"):
         wake(win)
-        button = _retry(lambda: win.child_window(title=NEW_ORDER_BUTTON, control_type="Button").wrapper_object())
+        button = _find_waking(
+            win, lambda: win.child_window(title=NEW_ORDER_BUTTON, control_type="Button").wrapper_object()
+        )
         tracing.point_at(button)
         button.iface_invoke.Invoke()
     with tracing.step("wait for the New Order editor"):
@@ -2224,6 +2293,65 @@ def find_item_line(editor: Any, sku: str) -> table.Row | None:
     return None
 
 
+def complete_item_line(
+    editor: Any,
+    sku: str,
+    qty: float | None = None,
+    discount: float | None = None,
+    total: float | None = None,
+) -> table.Row:
+    """Enter a line's quantity and discount, and see that the line took them
+    (steps 3.13-3.16).
+
+    The line's own total is the only honest proof that a cell was accepted: a
+    quantity or a discount can sit in its cell, read back correctly, and leave
+    the total untouched, which means the app never took it. So the values are
+    entered, the line is given time to recalculate, and where it still does
+    not come to what it should they are entered again.
+
+    Args:
+        editor (Any): The order or invoice editor.
+        sku (str): The line's item number.
+        qty (float | None): The quantity the document gives.
+        discount (float | None): The line's discount, if it has one.
+        total (float | None): What the line should come to, which is what
+            makes this checkable at all.
+
+    Returns:
+        table.Row: The line, as it reads once it has settled.
+
+    Raises:
+        ManualReviewRequired: If the line is not there, or never comes to
+            `total` however often the values are entered.
+    """
+    filled = None
+    for _ in range(LINE_ATTEMPTS):
+        line = find_item_line(editor, sku)
+        if line is None:
+            raise ManualReviewRequired(f"No order line for {sku!r} to complete", [])
+
+        if qty is not None:
+            set_item_cell(editor, line, QTY_COLUMN, f"{qty:g}")
+        if discount:
+            set_item_cell(editor, line, LINE_DISCOUNT_COLUMN, f"{discount:g}")
+
+        filled = settled_item_line(editor, sku, total)
+        if filled is None:
+            raise ManualReviewRequired(f"The line for {sku!r} disappeared while filling it", [])
+        if total is None or money(filled.get(LINE_PRICE_COLUMN)) == round(total, 2):
+            return filled
+        print(
+            f"line {sku}: came to {filled.get(LINE_PRICE_COLUMN)!r}, entering it again",
+            flush=True,
+        )
+
+    raise ManualReviewRequired(
+        f"The line for {sku!r} comes to {filled.get(LINE_PRICE_COLUMN)!r}, "
+        f"expected {total:.2f}",
+        [filled] if filled else [],
+    )
+
+
 def settled_item_line(editor: Any, sku: str, total: float | None, timeout: int = LINE_SETTLE_TIMEOUT) -> table.Row | None:
     """Read a line once the app has finished working out what it comes to.
 
@@ -3202,7 +3330,12 @@ def wait_for_dialog(win: WindowSpecification, title: str, timeout: int = DIALOG_
     while True:
         handle = _find_dialog(process_id, title)
         if handle:
-            return Application(backend="uia").connect(handle=handle).window(handle=handle)
+            dialog = Application(backend="uia").connect(handle=handle).window(handle=handle)
+            # On screen is not the same as ready: a dialog can exist for a
+            # moment with nothing published inside it, and returning then
+            # leaves the caller looking for a search box that is not there yet.
+            if _retry(lambda: bool(dialog.children())):
+                return dialog
         if time.monotonic() >= deadline:
             raise TimeoutError(f"No {title!r} dialog appeared within {timeout}s.")
         time.sleep(0.25)
@@ -3415,6 +3548,33 @@ def _grab_once(ctrl: Any) -> Image.Image:
         memory.DeleteDC()
         source.DeleteDC()
         win32gui.ReleaseDC(handle, window_dc)
+
+
+def _find_waking(win: WindowSpecification, find: Any, attempts: int = UIA_ATTEMPTS) -> Any:
+    """Look for a control, waking the window between tries.
+
+    A plain retry does not help when the window has published a partial tree:
+    the same query keeps missing the same control. Giving the window the focus
+    is what makes it publish the rest, so that is done between attempts.
+
+    Args:
+        win (WindowSpecification): The main window.
+        find (Any): A callable returning the control.
+        attempts (int): How many times to look.
+
+    Returns:
+        Any: Whatever `find` returned.
+
+    Raises:
+        Exception: Whatever the last attempt raised.
+    """
+    for attempt in range(attempts):
+        try:
+            return find()
+        except Exception:
+            if attempt == attempts - 1:
+                raise
+            wake(win, force=True)
 
 
 def _retry(action: Any, attempts: int = UIA_ATTEMPTS) -> Any:

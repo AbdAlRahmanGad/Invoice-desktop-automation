@@ -228,23 +228,17 @@ if __name__ == "__main__":
                         f"Product {sku!r} was saved but the picker still does not offer it", []
                     )
 
-            # 3.13-3.15: the quantity and discount this transaction was given.
+            # 3.13-3.16: the quantity and discount this transaction was
+            # given, and the check that the line really took them.
             order_editor = app.activate_editor(window, app.NEW_ORDER_TAB_RE, "New Order")
-            line = app.find_item_line(order_editor, sku)
-            if line is None:
-                raise app.ManualReviewRequired(f"No order line for {sku!r} to complete", [])
-            app.set_item_cell(order_editor, line, app.QTY_COLUMN, f"{item['qty']:g}")
-            if item["discount_pct"]:
-                app.set_item_cell(order_editor, line, app.LINE_DISCOUNT_COLUMN, f"{item['discount_pct']:g}")
-
-            # 3.14 and 3.16: what the product brought with it, and the total.
-            filled_line = app.item_line(order_editor, sku)
-            print(f"item {position}: {filled_line.cells if filled_line else 'unreadable'}")
-            price = app.money(filled_line.get(app.LINE_PRICE_COLUMN)) if filled_line else None
-            if price != item["line_total"]:
-                raise app.ManualReviewRequired(
-                    f"Line {position} comes to {price!r}, the document says {item['line_total']:.2f}", []
-                )
+            filled_line = app.complete_item_line(
+                order_editor,
+                sku,
+                qty=item["qty"],
+                discount=item["discount_pct"],
+                total=item["line_total"],
+            )
+            print(f"item {position}: {filled_line.cells}")
 
         # --- 4.1-4.3: nothing of the order's own, and totals that agree ----
         app.confirm_order_charges(order_editor)
