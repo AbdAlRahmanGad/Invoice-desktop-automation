@@ -23,6 +23,10 @@ from models import PostalAddress, SalesOrder, gross_price, line_total, parse_pos
 from sales_order import extract_sales_order
 
 
+#: How many times to enter a line's quantity and discount before giving up on
+#: the app taking them.
+LINE_ATTEMPTS = 3
+
 #: What the document says in Paid Status when it has been settled.
 PAID_STATUS = "paid"
 
@@ -324,20 +328,34 @@ def complete_line(win: object, order_editor: object, item: object) -> None:
             the product brought with it disagrees with the document, or if the
             line total does not come to what the document says it should.
     """
-    line = fakturama.find_item_line(order_editor, item.sku)
-    if line is None:
-        raise fakturama.ManualReviewRequired(f"No order line for {item.sku!r} to complete", [])
+    expected = line_total(item)
+    filled = None
+    for attempt in range(LINE_ATTEMPTS):
+        line = fakturama.find_item_line(order_editor, item.sku)
+        if line is None:
+            raise fakturama.ManualReviewRequired(f"No order line for {item.sku!r} to complete", [])
 
-    # 3.13 and 3.15: the quantity and the discount this transaction was given.
-    if item.qty is not None:
-        fakturama.set_item_cell(order_editor, line, fakturama.QTY_COLUMN, f"{item.qty:g}")
-    if item.discount_pct:
-        fakturama.set_item_cell(order_editor, line, fakturama.LINE_DISCOUNT_COLUMN, f"{item.discount_pct:g}")
+        # 3.13 and 3.15: the quantity and the discount this transaction was given.
+        if item.qty is not None:
+            fakturama.set_item_cell(order_editor, line, fakturama.QTY_COLUMN, f"{item.qty:g}")
+        if item.discount_pct:
+            fakturama.set_item_cell(order_editor, line, fakturama.LINE_DISCOUNT_COLUMN, f"{item.discount_pct:g}")
 
-    # 3.14 and 3.16: what the product brought with it, and what it comes to.
-    filled = fakturama.item_line(order_editor, item.sku)
-    if filled is None:
-        raise fakturama.ManualReviewRequired(f"The line for {item.sku!r} disappeared while filling it", [])
+        # 3.14 and 3.16: what the product brought with it, and what it comes
+        # to -- once the line has finished recalculating, not while it still
+        # shows the price it had before the quantity was entered.
+        #
+        # The line total is the only honest proof that a cell was accepted: a
+        # discount can sit in its cell, read back correctly, and leave the
+        # total untouched, which means the app never took it. Where that
+        # happens the values are entered again.
+        filled = fakturama.settled_item_line(order_editor, item.sku, expected)
+        if filled is None:
+            raise fakturama.ManualReviewRequired(f"The line for {item.sku!r} disappeared while filling it", [])
+        if expected is None or fakturama.money(filled.get(fakturama.LINE_PRICE_COLUMN)) == expected:
+            break
+        print(f"item {item.sku}: line came to {filled.get(fakturama.LINE_PRICE_COLUMN)!r}, entering it again", flush=True)
+
     check_line(filled, item)
 
 

@@ -220,8 +220,16 @@ INHERITED_LINE_COLUMNS = ("Item No", "Qty", "U.Price", "Discount", "Price")
 ITEM_NUMBER_COLUMN = "Item No"
 NAME_COLUMN = "Name"
 
+#: Seconds to let a line's own total catch up with a quantity or discount
+#: that was just typed into it.
+LINE_SETTLE_TIMEOUT = 10
+
 #: Seconds to let a resized window settle before reading it.
 WINDOW_SETTLE_SECONDS = 1.0
+
+#: A window showing no more children than this has not published its contents
+#: to the accessibility layer yet.
+THIN_TREE_CHILDREN = 3
 
 #: How far the item table's mouse canvas is inset inside the pane that draws
 #: it. The pair is what identifies the table in an editor.
@@ -310,6 +318,7 @@ DIALOG_CLASS = "#32770"
 TAB_TIMEOUT = 5
 TAB_CLICK_X = 0.25
 
+
 #: Tabs of the debtor editor that hold the billing address (step 2.7).
 ADDRESSES_TAB = "Addresses"
 MAIN_ADDRESS_TAB = "Main address"
@@ -355,32 +364,67 @@ def connect() -> WindowSpecification:
     """Attach to the already-running Fakturama main window.
 
     Returns:
-        WindowSpecification: The main window, focused.
+        WindowSpecification: The main window.
 
     Raises:
         RuntimeError: If no Fakturama window is open.
     """
-    try:
-        app = Application(backend="uia").connect(title_re=APP_TITLE_RE, timeout=10)
-    except Exception as exc:  # pywinauto raises several unrelated types here
+    handle = _retry(_main_window_handle)
+    if not handle:
         raise RuntimeError(
             "No running Fakturama window found. Start Fakturama first; this "
             "module attaches to a running instance rather than launching one."
-        ) from exc
-    win = app.window(title_re=APP_TITLE_RE)
-    # A minimized window draws nothing: its controls report empty rectangles
-    # and it renders no pixels, so neither reading a list nor clicking a row
-    # can work. Restore it -- without taking the foreground, so whatever the
-    # user is doing keeps it.
-    handle = win.element_info.handle
-    if win32gui.IsIconic(handle):
-        win32gui.ShowWindow(handle, win32con.SW_RESTORE)
-
+        )
+    win = Application(backend="uia").connect(handle=handle).window(handle=handle)
     # "visible", not "ready": a modal dialog disables the main window, and a
     # run that has to reopen the address selector legitimately attaches while
     # one is open.
     win.wait("visible", timeout=EDITOR_TIMEOUT)
+
+    wake(win)
     return win
+
+
+def wake(win: WindowSpecification) -> None:
+    """Make sure the window has published its contents to the tree.
+
+    Fakturama shows only its title bar and menu until something gives it the
+    focus -- every control below that is simply absent, so a lookup for a
+    toolbar button finds nothing and the app looks like it has no controls at
+    all. It can lapse back into that state between steps, so this is checked
+    wherever a run reaches for the window afresh, not only on attaching.
+
+    The focus is not forced while a dialog is up: the main window is disabled
+    then, and its tree is already built anyway.
+
+    Args:
+        win (WindowSpecification): The main window.
+    """
+    handle = win.element_info.handle
+    if win32gui.IsWindowEnabled(handle) and len(win.children()) <= THIN_TREE_CHILDREN:
+        with tracing.step("wake the window's controls"):
+            win.set_focus()
+            time.sleep(WINDOW_SETTLE_SECONDS)
+
+
+def _main_window_handle() -> int | None:
+    """The Fakturama window's handle, found by its caption.
+
+    Looked up through the window list rather than through UI Automation:
+    searching UIA by title intermittently fails to see a window that is
+    plainly on screen, and the caption is the same either way.
+
+    Returns:
+        int | None: The handle, or None when the app is not running.
+    """
+    found: list[int] = []
+
+    def visit(handle: int, _: Any) -> None:
+        if win32gui.IsWindowVisible(handle) and re.match(APP_TITLE_RE, win32gui.GetWindowText(handle)):
+            found.append(handle)
+
+    win32gui.EnumWindows(visit, None)
+    return found[0] if found else None
 
 
 def open_new_order(win: WindowSpecification) -> Any:
@@ -395,7 +439,8 @@ def open_new_order(win: WindowSpecification) -> Any:
             one the user has open.
     """
     with tracing.step(f"click {NEW_ORDER_BUTTON!r} in the toolbar"):
-        button = win.child_window(title=NEW_ORDER_BUTTON, control_type="Button").wrapper_object()
+        wake(win)
+        button = _retry(lambda: win.child_window(title=NEW_ORDER_BUTTON, control_type="Button").wrapper_object())
         tracing.point_at(button)
         button.iface_invoke.Invoke()
     with tracing.step("wait for the New Order editor"):
@@ -901,6 +946,11 @@ def activate_editor(win: WindowSpecification, title_re: str, what: str) -> Any:
     pattern = re.compile(title_re)
     tabs = [t for t in win.descendants(control_type="TabItem") if pattern.match(t.element_info.name or "")]
     if not tabs:
+        # An empty tree is not an empty application: it can mean the window
+        # has stopped publishing its contents.
+        wake(win)
+        tabs = [t for t in win.descendants(control_type="TabItem") if pattern.match(t.element_info.name or "")]
+    if not tabs:
         raise LookupError(f"No {what} editor is open.")
     # One of them may already be in front, in which case that is the one being
     # worked on -- switching away from it to the newest would be wrong, and
@@ -909,7 +959,15 @@ def activate_editor(win: WindowSpecification, title_re: str, what: str) -> Any:
     if not tab.is_selected():
         with tracing.step(f"switch to the {what} editor"):
             activate_tab(tab)
-    return wait_for_editor(win, title_re, what)
+
+    editor = wait_for_editor(win, title_re, what)
+    if not editor.children():
+        # In front, but with nothing published below it -- the same lapse
+        # `wake` deals with, and it would otherwise read as an editor that has
+        # no fields in it.
+        wake(win)
+        editor = wait_for_editor(win, title_re, what)
+    return editor
 
 
 def set_main_address(
@@ -1336,8 +1394,7 @@ def find_payment_method(win: WindowSpecification, method: str) -> table.Row | No
         ManualReviewRequired: If several exact rows, or a conflicting one,
             come back.
     """
-    view = open_list_view(win, TERMS_OF_PAYMENT_VIEW)
-    rows = search_list(view, method)
+    rows = search_view(win, TERMS_OF_PAYMENT_VIEW, method)
     exact = [r for r in rows if r.get("Name") == method and r.get("Description") == method]
     conflicting = [r for r in rows if (r.get("Name") == method) != (r.get("Description") == method)]
     if len(exact) > 1:
@@ -1689,23 +1746,23 @@ def confirm_order_addresses(editor: Any, parts_by_role: dict[str, list[str]]) ->
     return shown
 
 
-def vat_name(percentage: float) -> str:
+def vat_name(rate: float) -> str:
     """The name a VAT rate must carry to be reusable (step 3.5).
 
     Args:
-        percentage (float): The extracted VAT percentage, e.g. 19.0.
+        rate (float): The extracted VAT rate, e.g. 19.0.
 
     Returns:
         str: "VAT 19%" -- whole rates without a decimal part, since that is
             how the step writes them and how a person would type them.
     """
-    rounded = round(percentage, 2)
+    rounded = round(rate, 2)
     figure = int(rounded) if rounded == int(rounded) else rounded
     return f"{VAT_NAME_PREFIX} {figure}%"
 
 
 def percentage(text: str) -> float | None:
-    """Read a percentage out of what a field or a list cell shows.
+    """Read a rate out of what a field or a list cell shows.
 
     Args:
         text (str): Displayed value, e.g. "19.00 %" or "19%".
@@ -1749,12 +1806,12 @@ def open_row(win: WindowSpecification, view: Any, row: table.Row, name: str) -> 
         return wait_for_editor(win, f"^\\*?{re.escape(name)}$", name)
 
 
-def find_vat(win: WindowSpecification, percentage: float) -> table.Row | None:
+def find_vat(win: WindowSpecification, rate: float) -> table.Row | None:
     """Look up the VAT rate an item needs (steps 3.4-3.5).
 
     A rate is only reusable when everything about it agrees with the
-    document: it is named for its percentage, its value *is* that percentage,
-    and it is filed as the standard rate. A rate of the right name whose value
+    document: it is named for its percentage, its value *is* that
+    percentage, and it is filed as the standard rate. A rate of the right name whose value
     or code says something else is a disagreement about tax, which is not
     something to resolve by picking one.
 
@@ -1764,18 +1821,17 @@ def find_vat(win: WindowSpecification, percentage: float) -> table.Row | None:
 
     Args:
         win (WindowSpecification): The main window.
-        percentage (float): The extracted VAT percentage.
+        rate (float): The extracted VAT percentage.
 
     Returns:
         table.Row | None: The matching rate, or None if it has to be created.
 
     Raises:
         ManualReviewRequired: If a rate of that name disagrees about the
-            percentage or the e-invoice code, or several carry the name.
+            rate or the e-invoice code, or several carry the name.
     """
-    name = vat_name(percentage)
-    view = open_list_view(win, VATS_VIEW)
-    rows = search_list(view, name)
+    name = vat_name(rate)
+    rows = search_view(win, VATS_VIEW, name)
     named = [row for row in rows if _cell_matches(row.get("Name"), name)]
     if not named:
         return None
@@ -1784,18 +1840,18 @@ def find_vat(win: WindowSpecification, percentage: float) -> table.Row | None:
 
     row = named[0]
     value = percentage(row.get("Value"))
-    if value != percentage:
-        raise ManualReviewRequired(f"{name!r} is worth {row.get('Value')!r}, not {percentage}%", [row])
+    if value != rate:
+        raise ManualReviewRequired(f"{name!r} is worth {row.get('Value')!r}, not {rate}%", [row])
 
-    editor = open_row(win, view, row, name)
+    editor = open_row(win, open_list_view(win, VATS_VIEW), row, name)
     code = _field(editor, VAT_CODE_LABEL, control_type="ComboBox").selected_text()
     if code != STANDARD_VAT_CODE:
         raise ManualReviewRequired(f"{name!r} is coded {code!r}, not {STANDARD_VAT_CODE!r}", [row])
     return row
 
 
-def create_vat(win: WindowSpecification, percentage: float) -> Any:
-    """Fill in a new VAT rate for `percentage` (step 3.6).
+def create_vat(win: WindowSpecification, rate: float) -> Any:
+    """Fill in a new VAT rate for `rate` (step 3.6).
 
     Leaves the editor unsaved for the caller to save, and does not touch the
     displayed Standard rate: this rate is one an imported document needs, not
@@ -1803,7 +1859,7 @@ def create_vat(win: WindowSpecification, percentage: float) -> Any:
 
     Args:
         win (WindowSpecification): The main window.
-        percentage (float): The extracted VAT percentage.
+        rate (float): The extracted VAT percentage.
 
     Returns:
         Any: The unsaved editor.
@@ -1812,7 +1868,7 @@ def create_vat(win: WindowSpecification, percentage: float) -> Any:
         LookupError: If the view has no create button.
         ValueError: If a field does not hold what we entered.
     """
-    name = vat_name(percentage)
+    name = vat_name(rate)
     view = open_list_view(win, VATS_VIEW)
     buttons = [c for c in view.descendants(control_type="Button") if c.element_info.name == NEW_VAT_BUTTON]
     if not buttons:
@@ -1825,14 +1881,14 @@ def create_vat(win: WindowSpecification, percentage: float) -> Any:
 
         _set_text(editor, "Name", name)
         _set_text(editor, "Description", name)
-        _set_text(editor, VAT_VALUE_LABEL, f"{percentage:g}%")
+        _set_text(editor, VAT_VALUE_LABEL, f"{rate:g}%")
 
     code = _field(editor, VAT_CODE_LABEL, control_type="ComboBox").selected_text()
     if code != STANDARD_VAT_CODE:
         raise ValueError(f"A new rate is coded {code!r}, expected {STANDARD_VAT_CODE!r}.")
     shown = percentage(_field(editor, VAT_VALUE_LABEL).get_value())
-    if shown != percentage:
-        raise ValueError(f"Value reads {shown!r} after entering {percentage}%.")
+    if shown != rate:
+        raise ValueError(f"Value reads {shown!r} after entering {rate}%.")
     tracing.point_at(editor, colour=tracing.CONFIRM)
     return editor
 
@@ -2168,6 +2224,35 @@ def find_item_line(editor: Any, sku: str) -> table.Row | None:
     return None
 
 
+def settled_item_line(editor: Any, sku: str, total: float | None, timeout: int = LINE_SETTLE_TIMEOUT) -> table.Row | None:
+    """Read a line once the app has finished working out what it comes to.
+
+    A quantity or a discount lands in the cell before the line's own total
+    catches up, so reading straight afterwards can show the price the line had
+    a moment ago -- for a quantity of three at 40.00 that is 40.00, the price
+    of one, which looks exactly like a quantity that never took. Read until it
+    agrees with what the line should come to, or until the time is up: a line
+    that never gets there is a real disagreement, and the caller says so.
+
+    Args:
+        editor (Any): The order or invoice editor.
+        sku (str): The line's item number.
+        total (float | None): What the line should come to, if it is known.
+        timeout (int): Seconds to let it settle.
+
+    Returns:
+        table.Row | None: The line, settled if it settles.
+    """
+    deadline = time.monotonic() + timeout
+    line = item_line(editor, sku)
+    while total is not None and time.monotonic() < deadline:
+        if line is not None and money(line.get(LINE_PRICE_COLUMN)) == round(total, 2):
+            return line
+        time.sleep(RESULTS_POLL_SECONDS)
+        line = item_line(editor, sku)
+    return line
+
+
 def item_line(editor: Any, sku: str) -> table.Row | None:
     """A line's values, with every column on screen at once.
 
@@ -2398,6 +2483,113 @@ def _view_button(view: Any, name: str) -> Any | None:
     return buttons[0] if buttons else None
 
 
+def close_view(win: WindowSpecification, name: str) -> None:
+    """Close a list view, by the close button on its own tab.
+
+    Args:
+        win (WindowSpecification): The main window.
+        name (str): The view's name, e.g. "Documents".
+
+    Raises:
+        TimeoutError: If the view does not go away.
+    """
+    tabs = [t for t in win.descendants(control_type="TabItem") if t.element_info.name == name]
+    if not tabs:
+        return
+    tab = tabs[0]
+    activate_tab(tab)
+
+    folder = tab.parent()
+    handle = getattr(folder.element_info, "handle", None)
+    if not handle:
+        raise LookupError(f"The tab folder holding {name!r} has no window handle.")
+    left, top, _, _ = win32gui.GetWindowRect(handle)
+    middle = tab.rectangle().mid_point()
+    position = win32api.MAKELONG(middle.x - left, middle.y - top)
+    # Middle-clicked, not aimed at the little close cross: anywhere on the tab
+    # will do, where the cross has to be hit exactly and ignores a click that
+    # lands a few pixels off it.
+    win32gui.PostMessage(handle, win32con.WM_MBUTTONDOWN, win32con.MK_MBUTTON, position)
+    win32gui.PostMessage(handle, win32con.WM_MBUTTONUP, 0, position)
+
+    deadline = time.monotonic() + TAB_TIMEOUT
+    while any(t.element_info.name == name for t in win.descendants(control_type="TabItem")):
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"The {name!r} view did not close.")
+        time.sleep(0.1)
+
+
+def show_whole_list(view: Any) -> None:
+    """Clear a view's category filter, so its search covers everything.
+
+    The Documents view files its rows under a little tree -- Invoices into
+    paid and unpaid, Orders into shipped and not -- and whichever branch was
+    last clicked keeps filtering the list afterwards. Left on "Invoices /
+    unpaid", a search for an order number finds nothing at all, which reads
+    exactly like a document that was never saved. The first node is the whole
+    list; views without such a tree are unaffected.
+
+    Args:
+        view (Any): A list view.
+    """
+    items = view.descendants(control_type="TreeItem")
+    if not items:
+        return
+    try:
+        items[0].iface_selection_item.Select()
+        time.sleep(RESULTS_POLL_SECONDS)
+    except Exception:
+        return
+
+
+def search_view(win: WindowSpecification, name: str, term: str) -> list[table.Row]:
+    """Search a Data list, reopening it if it comes back empty.
+
+    A view holds the rows it was opened with, so anything saved since is in
+    the database but not in the list. Nothing found is therefore ambiguous --
+    it means "not there" or "not there yet" -- and the two have opposite
+    consequences: one says create the record, the other says one exists
+    already and a second would be a duplicate. Reopening settles it.
+
+    Args:
+        win (WindowSpecification): The main window.
+        name (str): The view's name, e.g. "VATs".
+        term (str): What to search for.
+
+    Returns:
+        list[table.Row]: What the list shows, after a reopen if it had nothing.
+    """
+    view = open_list_view(win, name)
+    show_whole_list(view)
+    rows = search_list(view, term)
+    if rows:
+        return rows
+
+    view = refresh_view(win, name)
+    show_whole_list(view)
+    return search_list(view, term)
+
+
+def refresh_view(win: WindowSpecification, name: str) -> Any:
+    """Close a list view and open it again, so it reads the database afresh.
+
+    A view holds the rows it was opened with. A document saved after that is
+    in the database but not in the list, and searching for it finds nothing --
+    which looks exactly like a save that did not happen. Reopening the view is
+    what tells the two apart.
+
+    Args:
+        win (WindowSpecification): The main window.
+        name (str): The view's name.
+
+    Returns:
+        Any: The reopened view.
+    """
+    with tracing.step(f"reopen the {name} list"):
+        close_view(win, name)
+        return open_list_view(win, name)
+
+
 def widen_view(win: WindowSpecification, name: str) -> Any:
     """Give a list view the whole window, and return it.
 
@@ -2486,11 +2678,25 @@ def confirm_document_row(
         ManualReviewRequired: If the order is not listed once, or a column
             disagrees with what was entered.
     """
+    widened = widen
     view = widen_view(win, DOCUMENTS_VIEW) if widen else open_list_view(win, DOCUMENTS_VIEW)
     try:
+        show_whole_list(view)
         rows = [row for row in search_list(view, number) if _cell_matches(row.get(DOCUMENT_COLUMN), number)]
+        if not rows:
+            # Nothing found does not yet mean the document is not there: the
+            # view holds the rows it was opened with, so anything saved since
+            # is missing from it. Look again at a freshly opened one.
+            # Widen again whatever the caller did: a reopened view comes back
+            # at its ordinary size, and a narrow one truncates the document
+            # number itself, so nothing would match however fresh it is.
+            refresh_view(win, DOCUMENTS_VIEW)
+            view = widen_view(win, DOCUMENTS_VIEW)
+            widened = True
+            show_whole_list(view)
+            rows = [row for row in search_list(view, number) if _cell_matches(row.get(DOCUMENT_COLUMN), number)]
     finally:
-        if widen:
+        if widened:
             unwiden_view(win, DOCUMENTS_VIEW)
     if len(rows) != 1:
         raise ManualReviewRequired(f"{len(rows)} documents are numbered {number!r}", rows)
